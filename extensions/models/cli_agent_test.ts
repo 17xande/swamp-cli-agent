@@ -30,6 +30,7 @@ import {
   buildPiCommand,
   canonicalCwd,
   classifyFailure,
+  claudeIsolationArgs,
   collectAmpExports,
   collectAmpUsageWithCache,
   CollectLocalUsageArgsSchema,
@@ -5560,7 +5561,8 @@ Deno.test("runWithRetries claudeConfigDir: ephemeral dir is passed to the child,
     /^\/.*\/swamp-cli-agent-claude-[A-Za-z0-9]+$/.test(configDir),
     true,
   );
-  assertEquals(argv.startsWith("--strict-mcp-config --model "), true);
+  assertEquals(argv.startsWith("--strict-mcp-config --settings "), true);
+  assertStringIncludes(argv, "claudeMdExcludes");
   assertEquals(argv.endsWith(" hello") || argv.includes(" hello"), true);
   await assertRejects(() => Deno.stat(configDir), Deno.errors.NotFound);
 });
@@ -5610,4 +5612,17 @@ Deno.test("resolveCallerClaudeConfigDir: resolves a symlinked caller config dir,
     "/home/agent/missing",
   );
   assertEquals(resolveCallerClaudeConfigDir(null, realPath), null);
+});
+
+Deno.test("claudeIsolationArgs: strict MCP plus claudeMdExcludes for the home-level CLAUDE.md files", () => {
+  const args = claudeIsolationArgs("/home/agent/");
+  assertEquals(args[0], "--strict-mcp-config");
+  assertEquals(args[1], "--settings");
+  assertEquals(JSON.parse(args[2]), {
+    claudeMdExcludes: [
+      "/home/agent/CLAUDE.md",
+      "/home/agent/.claude/CLAUDE.md",
+    ],
+  });
+  assertEquals(claudeIsolationArgs(""), ["--strict-mcp-config"]);
 });

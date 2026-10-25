@@ -307,8 +307,12 @@ existing behaviour.
 - **`ephemeral`** — a fresh empty directory (`mkdtemp`, mode 0700, honours
   `TMPDIR`) per invocation, removed afterwards.
 
-When set, the child gets `CLAUDE_CONFIG_DIR=<dir>` and `--strict-mcp-config`
-(no MCP servers load). On Linux bwrap the directory is bound read-write and the
+When set, the child gets `CLAUDE_CONFIG_DIR=<dir>`, `--strict-mcp-config` (no
+MCP servers load) and a `--settings` `claudeMdExcludes` for `~/CLAUDE.md` and
+`~/.claude/CLAUDE.md`. The exclude is needed because Claude Code discovers
+`CLAUDE.md` files by walking up from the working directory, independently of
+`CLAUDE_CONFIG_DIR`: for a repo under your home directory that walk reaches
+`~/.claude/CLAUDE.md` and would load your own instructions as project memory. On Linux bwrap the directory is bound read-write and the
 user's own `~/.claude` (and `$CLAUDE_CONFIG_DIR`, only if it lies under a
 directory the sandbox already exposes, such as `~/.local/state/...`; a config
 dir elsewhere stays hidden) are re-mounted read-only; `~/.claude.json` (which

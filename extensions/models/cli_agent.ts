@@ -124,7 +124,7 @@ export const RepositoryExpectationSchema = z.object({
 export type RepositoryExpectation = z.infer<typeof RepositoryExpectationSchema>;
 
 const CLAUDE_CONFIG_DIR_DESCRIPTION =
-  "Isolate the claude provider from the invoking user's Claude Code config (CLAUDE.md, skills, plugins, hooks, MCP servers). An absolute path (a leading '~/' expands against the sandbox home) is used as CLAUDE_CONFIG_DIR; 'ephemeral' creates a fresh empty directory per invocation and removes it afterwards. Also passes --strict-mcp-config. On Linux bwrap the directory is bound read-write, the user's own ~/.claude and CLAUDE_CONFIG_DIR (when under a directory the sandbox already exposes) are re-mounted read-only, and ~/.claude.json and the credential files of both are masked. The directory must not be the home directory, a parent of it, or equal to or a parent of ~/.claude or the caller's CLAUDE_CONFIG_DIR. On macOS seatbelt writes under the home directory are denied except the cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex and the opencode dirs, so a persistent directory under the home directory elsewhere is not writable (paths outside the home, such as /tmp, are). Authenticate through that directory's own login or CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY. Ignored (with a warning) for other providers; unset keeps today's behaviour.";
+  "Isolate the claude provider from the invoking user's Claude Code config (CLAUDE.md, skills, plugins, hooks, MCP servers). An absolute path (a leading '~/' expands against the sandbox home) is used as CLAUDE_CONFIG_DIR; 'ephemeral' creates a fresh empty directory per invocation and removes it afterwards. Also passes --strict-mcp-config, and excludes ~/CLAUDE.md and ~/.claude/CLAUDE.md, which CLAUDE.md discovery would otherwise pick up when walking up from a repo under the home directory. On Linux bwrap the directory is bound read-write, the user's own ~/.claude and CLAUDE_CONFIG_DIR (when under a directory the sandbox already exposes) are re-mounted read-only, and ~/.claude.json and the credential files of both are masked. The directory must not be the home directory, a parent of it, or equal to or a parent of ~/.claude or the caller's CLAUDE_CONFIG_DIR. On macOS seatbelt writes under the home directory are denied except the cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex and the opencode dirs, so a persistent directory under the home directory elsewhere is not writable (paths outside the home, such as /tmp, are). Authenticate through that directory's own login or CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY. Ignored (with a warning) for other providers; unset keeps today's behaviour.";
 
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
@@ -920,6 +920,31 @@ function resolveExecutablePath(command: string, cwd: string): string | null {
     }
   }
   return null;
+}
+
+/**
+ * Flags an isolated claude run adds after the binary. `--strict-mcp-config`
+ * loads only MCP servers passed explicitly (none are). `claudeMdExcludes`
+ * is needed because CLAUDE.md discovery walks up from the working directory
+ * independently of CLAUDE_CONFIG_DIR: for a repo under the home directory it
+ * reaches `~/.claude/CLAUDE.md` (and `~/CLAUDE.md`) and loads the user's own
+ * instructions as if they were project memory.
+ */
+export function claudeIsolationArgs(home: string): string[] {
+  const args = ["--strict-mcp-config"];
+  const normalizedHome = home ? normalizeAbsolutePath(home) : "";
+  if (normalizedHome) {
+    args.push(
+      "--settings",
+      JSON.stringify({
+        claudeMdExcludes: [
+          `${normalizedHome}/CLAUDE.md`,
+          `${normalizedHome}/.claude/CLAUDE.md`,
+        ],
+      }),
+    );
+  }
+  return args;
 }
 
 /**
@@ -3676,9 +3701,8 @@ export async function runWithRetries(
             Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
           );
         }
-        // Standalone boolean flag right after the binary, so only MCP servers
-        // passed explicitly load (none are); the prompt stays last.
-        cmd.splice(1, 0, "--strict-mcp-config");
+        // Right after the binary, so the prompt stays last.
+        cmd.splice(1, 0, ...claudeIsolationArgs(Deno.env.get("HOME") ?? ""));
       }
       lastResult = await runCli(cmd, {
         cwd: opts.cwd,
