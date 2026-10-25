@@ -3729,6 +3729,113 @@ Deno.test("buildBwrapArgs: extraBinds refuses binds that shadow writable state",
   );
 });
 
+Deno.test("buildBwrapArgs: a symlinked bind keeps its named destination and mounts the resolved source", () => {
+  const links = { "/home/agent/tools": "/home/agent/real/tools" };
+  const argv = bwrapWithExtraBinds([{ path: "~/tools" }], { links });
+  const idx = argv.indexOf("/home/agent/real/tools");
+  assertEquals(argv.slice(idx - 1, idx + 2), [
+    "--ro-bind",
+    "/home/agent/real/tools",
+    "/home/agent/tools",
+  ]);
+  // The mount point is created under its named path, not the target.
+  const dirIdx = argv.indexOf("/home/agent/tools");
+  assertEquals(argv[dirIdx - 1], "--dir");
+});
+
+Deno.test("buildBwrapArgs: a bind under a symlinked $HOME keeps its named destination", () => {
+  const links = { "/home/agent": "/data/agent" };
+  const argv = bwrapWithExtraBinds([{ path: "~/go" }], {
+    links: { ...links, "/home/agent/go": "/data/agent/go" },
+  });
+  const idx = argv.indexOf("/data/agent/go");
+  assertEquals(argv.slice(idx - 1, idx + 2), [
+    "--ro-bind",
+    "/data/agent/go",
+    "/home/agent/go",
+  ]);
+});
+
+Deno.test("buildBwrapArgs: extraBinds checks the normalized path, so .. segments collapse first", () => {
+  const argv = bwrapWithExtraBinds([{ path: "~/.config/swamp/../mise" }]);
+  assertEquals(argv.includes("/home/agent/.config/mise"), true);
+  assertThrows(
+    () => bwrapWithExtraBinds([{ path: "~/.config/mise/../swamp" }]),
+    Error,
+    "refused",
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses extra credential files, /run/user and Docker sockets", () => {
+  for (
+    const path of [
+      "~/.cargo",
+      "~/.cargo/credentials.toml",
+      "~/.cargo/credentials",
+      "~/.git-credentials",
+      "~/.m2/settings.xml",
+      "~/.gradle/gradle.properties",
+      "~/.gem/credentials",
+      "~/.terraform.d",
+      "~/.azure",
+      "~/.password-store",
+      "~/.npmrc",
+      "~/.pypirc",
+      "/run/user",
+      "/run/user/1000",
+      "/run/user/1000/gnupg/S.gpg-agent",
+      "/run",
+      "/var/run/docker.sock",
+      "/run/docker.sock",
+    ]
+  ) {
+    assertThrows(
+      () => bwrapWithExtraBinds([{ path }]),
+      Error,
+      "refused",
+      path,
+    );
+  }
+  assertEquals(
+    bwrapWithExtraBinds([{ path: "~/.cargo/bin" }]).includes(
+      "/home/agent/.cargo/bin",
+    ),
+    true,
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses a file bind inside another bound directory", () => {
+  assertThrows(
+    () =>
+      bwrapWithExtraBinds(
+        [{ path: "~/.local/share/mise" }, {
+          path: "~/.local/share/mise/settings.toml",
+          mode: "rw",
+        }],
+        { files: ["/home/agent/.local/share/mise/settings.toml"] },
+      ),
+    Error,
+    "inside bound directory",
+  );
+  // A file next to a directory bind is fine.
+  bwrapWithExtraBinds(
+    [{ path: "~/.local/share/mise" }, { path: "~/.gitconfig" }],
+    { files: ["/home/agent/.gitconfig"] },
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses sources and mount points inside writable state dirs", () => {
+  const links = { "/opt/tools": "/home/agent/.cache/tools" };
+  for (const path of ["/opt/tools", "~/.cache/tools", "~/.local/state/x"]) {
+    assertThrows(
+      () => bwrapWithExtraBinds([{ path }], { links }),
+      Error,
+      "refused",
+      path,
+    );
+  }
+});
+
 Deno.test("buildBwrapArgs: a bind that is a parent of the cwd leaves the cwd writable", () => {
   const argv = bwrapWithExtraBinds(
     [{ path: "/srv", mode: "ro" }],

@@ -198,7 +198,7 @@ export const GlobalArgsSchema = z.object({
       "Linux bwrap credential policy. 'provider' (default) permits only the selected provider's known file-backed login credentials so ordinary CLI login works. 'isolated' masks all known credential files and requires environment authentication. Seatbelt on macOS keeps its existing static credential policy.",
     ),
   extraBinds: z.array(ExtraBindSchema).default([]).describe(
-    "Extra host paths mounted into the Linux bwrap sandbox, e.g. $HOME-installed toolchains (~/.local/share/mise, ~/go) that are otherwise hidden. Mounted read-only unless mode is 'rw'. Paths that do not exist are skipped; paths that equal or contain $HOME, a credential file, a state directory or anything in EXTRA_BIND_DENIED_PATHS are refused. Symlinks are resolved first. Preflight and checkFactoryViability use only this global list, not per-invocation overrides. Ignored (with a warning) on macOS Seatbelt.",
+    "Extra host paths mounted into the Linux bwrap sandbox, e.g. $HOME-installed toolchains (~/.local/share/mise, ~/go) that are otherwise hidden. Mounted read-only unless mode is 'rw'. Paths that do not exist are skipped; paths that equal or contain $HOME, a credential file, a state directory, /run/user, a Docker socket or anything in EXTRA_BIND_DENIED_PATHS are refused, as is a file inside another bound directory. A symlink is mounted at its named path with the resolved target as source. The denylist is best-effort. Preflight and checkFactoryViability use only this global list, not per-invocation overrides. Ignored (with a warning) on macOS Seatbelt.",
   ),
 });
 
@@ -622,26 +622,64 @@ const EXTRA_BIND_DENIED_PATHS: readonly string[] = [
   ".netrc",
   ".docker/config.json",
   ".kube",
+  ".cargo/credentials.toml",
+  ".cargo/credentials",
+  ".git-credentials",
+  ".m2/settings.xml",
+  ".gradle/gradle.properties",
+  ".gem/credentials",
+  ".terraform.d",
+  ".azure",
+  ".password-store",
+  ".npmrc",
+  ".pypirc",
 ];
+
+/**
+ * Absolute paths outside home that an `extraBinds` entry must not equal,
+ * contain, or sit inside: per-user runtime dirs hold ssh-agent/gpg-agent
+ * sockets, and the Docker socket is root-equivalent.
+ */
+const EXTRA_BIND_DENIED_ABSOLUTE: readonly string[] = [
+  "/run/user",
+  "/run/docker.sock",
+  "/var/run/docker.sock",
+];
+
+/** Lexically collapse `//`, `.`, `..` and a trailing `/` (no symlink lookup). */
+function normalizePath(p: string): string {
+  const parts: string[] = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") parts.pop();
+    else parts.push(seg);
+  }
+  return `/${parts.join("/")}`;
+}
 
 type ResolvedExtraBind = {
   /** Resolved (symlink-free) host path. */
   source: string;
-  /** Mount point inside the sandbox. */
+  /** Mount point inside the sandbox: the normalized path as given. */
   dest: string;
   mode: "ro" | "rw";
   isDirectory: boolean;
 };
 
 /**
- * Expand, resolve and vet `extraBinds` for {@link buildBwrapArgs}. Paths are
- * resolved with `realPath` (collapsing `..`, `.`, `//` and symlinks) BEFORE
- * the checks, and the resolved path is what gets mounted, so a textual trick
- * cannot reach a protected path. Paths that do not resolve are dropped. A
- * path is refused (throws) if it is `/`, equals or contains `home`, equals or
- * contains a STATE_DIRS entry or `claudeConfigDir` (a bind would shadow
- * their writable mounts or undo a read-only re-mount), or equals, contains or
- * sits inside an EXTRA_BIND_DENIED_PATHS / CREDENTIAL_FILES entry.
+ * Expand, resolve and vet `extraBinds` for {@link buildBwrapArgs}. Each path
+ * is lexically normalized (collapsing `..`, `.`, `//`) to give the mount
+ * point `dest`, and resolved with `realPath` (also following symlinks) to give
+ * the mounted `source`; the checks run on BOTH, so a textual or symlink trick
+ * cannot reach a protected path, while a symlinked bind keeps its named
+ * destination. Paths that do not resolve are dropped. A path is refused
+ * (throws) if it is `/`, equals or contains `home`, overlaps a STATE_DIRS
+ * entry or `claudeConfigDir` (a bind would shadow their writable mounts, and
+ * a source inside them could be swapped for a symlink by a concurrent
+ * sandboxed agent between resolve and mount), overlaps an
+ * EXTRA_BIND_DENIED_PATHS / CREDENTIAL_FILES / EXTRA_BIND_DENIED_ABSOLUTE
+ * entry, or is a file inside another bound directory (the directory bind
+ * would be emitted later and shadow the file's mode).
  */
 function resolveExtraBinds(
   extraBinds: readonly ExtraBind[],
@@ -682,11 +720,13 @@ function resolveExtraBinds(
   const refuseIfProtected = (given: string, p: string): void => {
     const hit = homes.some((h) => contains(p, h))
       ? home
-      : secrets.find((d) => contains(p, d) || contains(d, p)) ??
-        stateful.find((d) => contains(p, d));
+      : [...secrets, ...EXTRA_BIND_DENIED_ABSOLUTE].find((d) =>
+        contains(p, d) || contains(d, p)
+      ) ??
+        stateful.find((d) => contains(p, d) || contains(d, p));
     if (hit !== undefined) {
       throw new Error(
-        `extraBinds path ${given} is refused: it equals or contains protected path ${hit}`,
+        `extraBinds path ${given} is refused: it overlaps protected path ${hit}`,
       );
     }
   };
@@ -701,19 +741,27 @@ function resolveExtraBinds(
         `extraBinds path must be absolute or start with '~/': ${bind.path}`,
       );
     }
-    refuseIfProtected(bind.path, expanded.replace(/\/+$/, "") || "/");
+    const dest = normalizePath(expanded);
+    refuseIfProtected(bind.path, dest);
     const source = tryReal(expanded);
     if (source === null) continue;
     refuseIfProtected(bind.path, source);
-    const dest = homeReal !== home && source.startsWith(`${homeReal}/`)
-      ? `${home}${source.slice(homeReal.length)}`
-      : source;
     out.push({
       source,
       dest,
       mode: bind.mode ?? "ro",
       isDirectory: isDirectory(source),
     });
+  }
+  for (const file of out.filter((b) => !b.isDirectory)) {
+    const dir = out.find((b) =>
+      b.isDirectory && file.dest.startsWith(`${b.dest}/`)
+    );
+    if (dir !== undefined) {
+      throw new Error(
+        `extraBinds file ${file.dest} is refused: it lies inside bound directory ${dir.dest}; bind the directory instead`,
+      );
+    }
   }
   return out;
 }
@@ -802,15 +850,15 @@ type BwrapArg = string;
  * bind.
  *
  * `extraBinds` mounts caller-chosen host paths (e.g. `~/.local/share/mise`)
- * at their resolved path inside the sandbox, `--ro-bind` unless `mode` is
+ * at their named (normalized) path inside the sandbox, `--ro-bind` unless `mode` is
  * `"rw"`. Directories are emitted AFTER `--remount-ro home` (so the home
  * tmpfs cannot shadow them) and BEFORE the workspace bind (which still wins
  * on overlap); a FILE under home is bound BEFORE the remount, while the
  * tmpfs is writable (the remount is not recursive, so it keeps its own mode).
  * Missing paths are skipped; a relative path, or a path that equals or
- * contains `/`, `home`, a state directory, `claudeConfigDir`, or equals,
- * contains or sits inside an EXTRA_BIND_DENIED_PATHS / CREDENTIAL_FILES
- * entry, throws so the feature cannot unmask secrets (see
+ * contains `/`, `home`, or overlaps a state directory, `claudeConfigDir`, an
+ * EXTRA_BIND_DENIED_PATHS / CREDENTIAL_FILES entry, `/run/user` or a Docker
+ * socket, or a file bind inside another bound directory, throws so the feature cannot unmask secrets (see
  * {@link resolveExtraBinds}). `realPath` and `isDirectory` are injected.
  */
 export function buildBwrapArgs(
