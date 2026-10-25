@@ -3506,6 +3506,137 @@ Deno.test("buildBwrapArgs: cwd bind is placed after --remount-ro home (not shado
   assertEquals(argv[bindIdx + 2], "/home/agent/tmp/work");
 });
 
+// --- extraBinds (issue #23) -------------------------------------------------
+
+const bwrapWithExtraBinds = (
+  extraBinds: { path: string; mode?: "ro" | "rw" }[],
+  exists: (p: string) => boolean = () => true,
+  cwd = "/home/agent/work",
+) =>
+  buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    cwd,
+    "/home/agent",
+    exists,
+    null,
+    "claude",
+    "provider",
+    null,
+    null,
+    null,
+    [],
+    extraBinds,
+  );
+
+Deno.test("buildBwrapArgs: extraBinds emits --ro-bind by default and --bind for rw", () => {
+  const argv = bwrapWithExtraBinds([
+    { path: "/opt/toolchain" },
+    { path: "/opt/cache", mode: "rw" },
+  ]);
+  const roIdx = argv.indexOf("/opt/toolchain");
+  assertEquals(argv.slice(roIdx - 1, roIdx + 2), [
+    "--ro-bind",
+    "/opt/toolchain",
+    "/opt/toolchain",
+  ]);
+  const rwIdx = argv.indexOf("/opt/cache");
+  assertEquals(argv.slice(rwIdx - 1, rwIdx + 2), [
+    "--bind",
+    "/opt/cache",
+    "/opt/cache",
+  ]);
+});
+
+Deno.test("buildBwrapArgs: extraBinds come after --remount-ro home and before the cwd bind", () => {
+  const argv = bwrapWithExtraBinds([{ path: "/home/agent/go", mode: "rw" }]);
+  const remountIdx = argv.indexOf("--remount-ro");
+  const extraIdx = argv.indexOf("/home/agent/go", remountIdx);
+  const cwdIdx = argv.indexOf("/home/agent/work", remountIdx);
+  assertEquals(remountIdx > -1 && extraIdx > remountIdx, true);
+  assertEquals(extraIdx < cwdIdx, true);
+  // The mount point is created on the tmpfs while home is still writable.
+  const dirIdx = argv.indexOf("/home/agent/go");
+  assertEquals(argv[dirIdx - 1], "--dir");
+  assertEquals(dirIdx < remountIdx, true);
+});
+
+Deno.test("buildBwrapArgs: extraBinds skips paths that do not exist", () => {
+  const argv = bwrapWithExtraBinds(
+    [{ path: "/opt/missing" }],
+    (p) => p !== "/opt/missing",
+  );
+  assertEquals(argv.includes("/opt/missing"), false);
+});
+
+Deno.test("buildBwrapArgs: extraBinds expands a leading ~/ against home", () => {
+  const argv = bwrapWithExtraBinds([{ path: "~/.local/share/mise" }]);
+  const idx = argv.lastIndexOf("/home/agent/.local/share/mise") - 1;
+  assertEquals(argv.slice(idx - 1, idx + 2), [
+    "--ro-bind",
+    "/home/agent/.local/share/mise",
+    "/home/agent/.local/share/mise",
+  ]);
+  assertEquals(argv.includes("~/.local/share/mise"), false);
+});
+
+Deno.test("buildBwrapArgs: extraBinds rejects relative paths", () => {
+  assertThrows(
+    () => bwrapWithExtraBinds([{ path: "relative/dir" }]),
+    Error,
+    "absolute",
+  );
+  assertEquals(
+    GlobalArgsSchema.safeParse({ extraBinds: [{ path: "relative/dir" }] })
+      .success,
+    false,
+  );
+});
+
+Deno.test("buildBwrapArgs: extraBinds refuses paths equal to or containing a credential file", () => {
+  for (
+    const path of [
+      "/home/agent/.claude/.credentials.json",
+      "/home/agent/.claude",
+      "~/.codex/",
+      "/home/agent",
+      "/",
+    ]
+  ) {
+    assertThrows(
+      () => bwrapWithExtraBinds([{ path, mode: "rw" }], () => false),
+      Error,
+      "credential",
+      path,
+    );
+  }
+});
+
+Deno.test("buildBwrapArgs: empty extraBinds leaves argv unchanged", () => {
+  const base = buildBwrapArgs(
+    ["claude", "--print", "hi"],
+    "/home/agent/work",
+    "/home/agent",
+    () => true,
+    null,
+    "claude",
+    "provider",
+  );
+  assertEquals(bwrapWithExtraBinds([]), base);
+});
+
+Deno.test("sandboxConfigFrom: per-invocation extraBinds replace the global list", () => {
+  const g = GlobalArgsSchema.parse({ extraBinds: [{ path: "/opt/a" }] });
+  assertEquals(
+    sandboxConfigFrom(g, () => "").extraBinds,
+    [{ path: "/opt/a", mode: "ro" }],
+  );
+  assertEquals(
+    sandboxConfigFrom(g, () => "", { extraBinds: [{ path: "/opt/b" }] })
+      .extraBinds,
+    [{ path: "/opt/b" }],
+  );
+});
+
 Deno.test("buildBwrapArgs: exposes linked-worktree Git metadata read-only after the home remount", () => {
   const gitMetadata = "/home/agent/repo/.git";
   const argv = buildBwrapArgs(

@@ -114,6 +114,23 @@ const SandboxNetworkEnum = z.enum(["allow", "deny"]);
  */
 const SandboxCredentialAccessEnum = z.enum(["provider", "isolated"]);
 
+/**
+ * An extra host path mounted into the Linux bwrap sandbox (see
+ * {@link buildBwrapArgs}). `path` is absolute or `~/`-relative (expanded
+ * against the sandbox `home`); `mode` defaults to read-only.
+ */
+const ExtraBindSchema = z.object({
+  path: z.string().refine((p) => p.startsWith("/") || p.startsWith("~/"), {
+    message: "extraBinds path must be absolute or start with '~/'",
+  }).describe(
+    "Host path to mount at the same path inside the sandbox. Must be absolute or start with '~/' (expanded against $HOME).",
+  ),
+  mode: z.enum(["ro", "rw"]).default("ro").describe(
+    "'ro' (default; read-only) or 'rw' (writable).",
+  ),
+});
+type ExtraBind = z.input<typeof ExtraBindSchema>;
+
 const TimeoutMsSchema = z.number().int().min(1_000).max(3_600_000);
 
 export const RepositoryExpectationSchema = z.object({
@@ -180,6 +197,9 @@ export const GlobalArgsSchema = z.object({
     .describe(
       "Linux bwrap credential policy. 'provider' (default) permits only the selected provider's known file-backed login credentials so ordinary CLI login works. 'isolated' masks all known credential files and requires environment authentication. Seatbelt on macOS keeps its existing static credential policy.",
     ),
+  extraBinds: z.array(ExtraBindSchema).default([]).describe(
+    "Extra host paths mounted into the Linux bwrap sandbox, e.g. $HOME-installed toolchains (~/.local/share/mise, ~/go) that are otherwise hidden. Mounted read-only unless mode is 'rw'. Paths that do not exist are skipped; paths that equal or contain a known credential file are refused. Ignored (with a warning) on macOS Seatbelt.",
+  ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -415,6 +435,8 @@ type SandboxConfig = {
   credentialAccess: "provider" | "isolated";
   /** Effective network policy used to select the sandbox profile. */
   network?: "allow" | "deny";
+  /** Extra host paths mounted into the bwrap sandbox (ignored by Seatbelt). */
+  extraBinds?: readonly ExtraBind[];
   /**
    * Path to the Seatbelt .sb profile; only read/needed when the EFFECTIVE
    * backend (see {@link resolveEffectiveBackend}) is seatbelt.
@@ -664,6 +686,13 @@ type BwrapArg = string;
  * `executablePath` is the resolved host file to mount at the stable sandbox
  * path, or null when the command is already reachable through an existing
  * bind.
+ *
+ * `extraBinds` mounts caller-chosen host paths (e.g. `~/.local/share/mise`)
+ * at the same path inside the sandbox, `--ro-bind` unless `mode` is `"rw"`.
+ * They are emitted AFTER `--remount-ro home` (so the home tmpfs cannot shadow
+ * them) and BEFORE the workspace bind (which still wins on overlap). Missing
+ * paths are skipped; a relative path, or a path that equals or contains a
+ * known credential file, throws so the feature cannot unmask credentials.
  */
 export function buildBwrapArgs(
   cmd: string[],
@@ -677,7 +706,31 @@ export function buildBwrapArgs(
   executableDirectoryPath: string | null = null,
   gitMetadataPath: string | null = null,
   readOnlyInputFiles: readonly string[] = [],
+  extraBinds: readonly ExtraBind[] = [],
 ): string[] {
+  const resolvedExtraBinds = extraBinds.map((bind) => {
+    const path = bind.path.startsWith("~/")
+      ? `${home}${bind.path.slice(1)}`
+      : bind.path;
+    if (!path.startsWith("/")) {
+      throw new Error(
+        `extraBinds path must be absolute or start with '~/': ${bind.path}`,
+      );
+    }
+    const normalized = path.length > 1 ? path.replace(/\/+$/, "") : path;
+    for (const rel of CREDENTIAL_FILES) {
+      const credential = `${home}/${rel}`;
+      if (
+        normalized === "/" || normalized === credential ||
+        credential.startsWith(`${normalized}/`)
+      ) {
+        throw new Error(
+          `extraBinds path ${bind.path} would expose credential file ${credential}`,
+        );
+      }
+    }
+    return { path: normalized, mode: bind.mode ?? "ro" };
+  }).filter((bind) => pathExists(bind.path));
   const executableName = executablePath?.split("/").at(-1) ?? "provider";
   const sandboxExecutable = executableDirectoryPath
     ? `/run/cli-agent/provider-package/${executableName}`
@@ -792,11 +845,21 @@ export function buildBwrapArgs(
   if (gitMetadataPath?.startsWith(home + "/")) {
     args.push("--dir", gitMetadataPath);
   }
+  for (const bind of resolvedExtraBinds) {
+    if (bind.path.startsWith(home + "/")) args.push("--dir", bind.path);
+  }
   args.push("--remount-ro", home);
   // Bind the workspace AFTER the home tmpfs+remount-ro bracket. If cwd is
   // under home (e.g. /home/user/tmp/...), binding it before --tmpfs home
   // would shadow it with the tmpfs. Binding after --remount-ro home creates
   // a writable mount point on top of the read-only home tree.
+  for (const bind of resolvedExtraBinds) {
+    args.push(
+      bind.mode === "rw" ? "--bind" : "--ro-bind",
+      bind.path,
+      bind.path,
+    );
+  }
   args.push("--bind", cwd, cwd);
   if (gitMetadataPath) {
     args.push("--ro-bind", gitMetadataPath, gitMetadataPath);
@@ -958,6 +1021,12 @@ export function wrapWithSandbox(
         cmd,
       );
     }
+    if (sandbox.extraBinds?.length) {
+      logger?.warning(
+        "extraBinds is ignored on the Seatbelt backend (bwrap only); {count} extra bind(s) not applied.",
+        { count: sandbox.extraBinds.length },
+      );
+    }
     return [
       sandboxExecPath,
       "-f",
@@ -1030,6 +1099,7 @@ export function wrapWithSandbox(
         executableDirectoryPath,
         gitMetadataPath,
         readOnlyInputFiles,
+        sandbox.extraBinds ?? [],
       ),
     ];
   }
@@ -3288,6 +3358,7 @@ export function sandboxConfigFrom(
     sandboxRequired?: boolean;
     sandboxNetwork?: "allow" | "deny";
     sandboxCredentialAccess?: "provider" | "isolated";
+    extraBinds?: readonly ExtraBind[];
   },
 ): SandboxConfig & { network: "allow" | "deny" } {
   const mode = overrides?.sandboxMode ?? g.sandboxMode;
@@ -3305,6 +3376,7 @@ export function sandboxConfigFrom(
     credentialAccess: overrides?.sandboxCredentialAccess ??
       g.sandboxCredentialAccess,
     network,
+    extraBinds: overrides?.extraBinds ?? g.extraBinds,
     profilePath,
     required: overrides?.sandboxRequired ?? g.sandboxRequired,
   };
@@ -3915,6 +3987,9 @@ export const InvokeArgsSchema = z.object({
   ),
   sandboxCredentialAccess: SandboxCredentialAccessEnum.optional().describe(
     "Override Linux bwrap credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication). Seatbelt on macOS is unchanged.",
+  ),
+  extraBinds: z.array(ExtraBindSchema).optional().describe(
+    "Override the global extraBinds for this invocation (replaces, not merges): extra host paths mounted into the Linux bwrap sandbox, read-only unless mode is 'rw'. Ignored on macOS Seatbelt.",
   ),
 }).superRefine((args, ctx) => {
   if (
@@ -5719,6 +5794,7 @@ export const model = {
             sandboxRequired: args.sandboxRequired,
             sandboxNetwork: args.sandboxNetwork,
             sandboxCredentialAccess: args.sandboxCredentialAccess,
+            extraBinds: args.extraBinds,
           },
         );
 
@@ -5912,6 +5988,7 @@ export const model = {
             sandboxRequired: args.sandboxRequired,
             sandboxNetwork: args.sandboxNetwork,
             sandboxCredentialAccess: args.sandboxCredentialAccess,
+            extraBinds: args.extraBinds,
           },
         );
 

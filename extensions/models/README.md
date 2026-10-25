@@ -36,6 +36,7 @@ models:
       wallTimeoutMs: 3600000      # 1 hour wall-clock timeout
       maxRetries: 2               # retry count for transient failures
       sandboxCredentialAccess: provider # provider (normal CLI login) | isolated
+      extraBinds: []              # extra paths mounted into the Linux bwrap sandbox
 ```
 
 CLI paths (`claudePath`, `opencodePath`, `ampPath`, `geminiPath`, `codexPath`,
@@ -56,6 +57,25 @@ as an API key or Claude's official `CLAUDE_CODE_OAUTH_TOKEN` generated with
 `claude setup-token`. This setting controls Linux bwrap only. On macOS, the
 existing static Seatbelt policy is unchanged: Claude Code can use its normal
 Keychain-backed login while known file-backed credentials remain masked.
+
+**Toolchains under `$HOME` (Linux bwrap):** the sandbox hides `$HOME` except the
+workspace and a fixed set of state directories, so toolchains installed there
+(mise, asdf, `~/go`, `~/.cargo`) are invisible and an `actor` run can edit code
+but not build or test it. List them in `extraBinds` (global argument, or a
+per-invocation override on `invoke`/`invokeAndParse` that replaces the global
+list). Each entry is `{ path, mode }`; `path` must be absolute or start with
+`~/`, and `mode` is `ro` (default) or `rw`. Paths that do not exist are skipped.
+A path that equals or contains a known credential file (for example `~` or
+`~/.claude`) is refused. `extraBinds` is applied on Linux bwrap only; on macOS
+Seatbelt it is ignored with a warning.
+
+```yaml
+    globalArgs:
+      extraBinds:
+        - path: ~/.local/share/mise   # ro (default): mise-managed toolchains
+        - path: ~/go                  # rw: GOPATH build/module cache
+          mode: rw
+```
 
 On Linux, standard linked Git worktrees are supported under bwrap. The linked
 worktree remains the only writable repository path; its external common `.git`
@@ -128,6 +148,7 @@ Arguments:
 | `wallTimeoutMs` | number   | no       | Override wall timeout in milliseconds         |
 | `idleTimeoutMs` | number   | no       | Override idle timeout independently           |
 | `sandboxCredentialAccess` | enum | no | `provider` for selected-provider CLI login (default), or `isolated` to mask all known credential files |
+| `extraBinds` | array | no | Override the global `extraBinds` (`{ path, mode: ro\|rw }`) for this invocation; Linux bwrap only |
 
 ### `invokeAndParse`
 
