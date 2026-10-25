@@ -309,13 +309,18 @@ existing behaviour.
 
 When set, the child gets `CLAUDE_CONFIG_DIR=<dir>` and `--strict-mcp-config`
 (no MCP servers load). On Linux bwrap the directory is bound read-write and the
-user's own `~/.claude` (and `$CLAUDE_CONFIG_DIR`, if inside the home) are
-re-mounted read-only; `~/.claude.json` (which holds user-scope MCP servers) and
-`~/.claude/.credentials.json` are masked with `/dev/null`. macOS Seatbelt gets
-the env var and flag but no read-only re-mounting or masking, and its static
-profile only allows writes under the cwd, `~/.cache`, `~/.deno`, `~/.claude`,
-`~/.codex`, the opencode directories and `/tmp`, so a persistent directory
-elsewhere is not writable there (a warning is logged).
+user's own `~/.claude` (and `$CLAUDE_CONFIG_DIR`, only if it lies under a
+directory the sandbox already exposes, such as `~/.local/state/...`; a config
+dir elsewhere stays hidden) are re-mounted read-only; `~/.claude.json` (which
+holds user-scope MCP servers) and the `.credentials.json` / `.claude.json` of
+both config dirs are masked with `/dev/null`. The directory is also checked
+after following symlinks, so a link to (or above) your home, `~/.claude` or
+`$CLAUDE_CONFIG_DIR` is rejected. macOS Seatbelt gets the env var and flag but
+no read-only re-mounting or masking. Its static profile denies writes under
+`$HOME` except the cwd, `~/.cache`, `~/.deno`, `~/.claude`, `~/.codex` and the
+opencode directories, so a persistent directory elsewhere under the home is not
+writable there (a warning is logged); paths outside the home, such as `/tmp`,
+stay writable.
 
 **Authentication.** User credential files are not copied. Log in once per
 directory with `CLAUDE_CONFIG_DIR=<dir> claude` then `/login`, or run

@@ -20,6 +20,7 @@ import {
   ampPermissions,
   ampUsageCacheName,
   arbitrateSignalOutcome,
+  assertClaudeConfigDirRealPath,
   buildAmpCommand,
   buildBwrapArgs,
   buildClaudeCommand,
@@ -5194,12 +5195,24 @@ Deno.test("buildBwrapArgs claudeConfigDir: masks claude credential files when is
 });
 
 Deno.test("buildBwrapArgs claudeConfigDir: skips missing user config", () => {
-  const argv = bwrapClaude("/home/agent/.claude");
-  assertEquals(bindIndexes(argv, "--ro-bind", "/home/agent/.claude"), []);
-  assertEquals(
-    bindIndexes(argv, "--bind", "/home/agent/.claude").length >= 1,
-    true,
+  const argv = bwrapClaude("/home/agent/.claude/isolated");
+  assertEquals(bindIndexes(argv, "--ro-bind", "/home/agent/.claude").length, 1);
+  const missing = buildBwrapArgs(
+    ["claude"],
+    "/work/dir",
+    CLAUDE_BWRAP_HOME,
+    (p) => p === "/home/agent/.cache",
+    null,
+    "claude",
+    "provider",
+    null,
+    null,
+    null,
+    [],
+    "/home/agent/.claude/isolated",
+    null,
   );
+  assertEquals(bindIndexes(missing, "--ro-bind", "/home/agent/.claude"), []);
   const none = buildBwrapArgs(
     ["claude"],
     "/work/dir",
@@ -5218,21 +5231,187 @@ Deno.test("buildBwrapArgs claudeConfigDir: skips missing user config", () => {
   assertEquals(none.includes("/home/nobody/.claude"), false);
 });
 
+Deno.test("buildBwrapArgs claudeConfigDir: caller dir outside STATE_DIRS is not exposed", () => {
+  const exists = (p: string) =>
+    claudeBwrapExists(p) || p === "/home/agent/claude-alt" ||
+    p === "/home/agent/claude-alt/.credentials.json";
+  const build = (dir: string | null, caller: string | null) =>
+    buildBwrapArgs(
+      ["claude"],
+      "/work/dir",
+      CLAUDE_BWRAP_HOME,
+      exists,
+      null,
+      "claude",
+      "provider",
+      null,
+      null,
+      null,
+      [],
+      dir,
+      caller,
+    );
+  const isolated = build(
+    "/home/agent/.local/share/cfg",
+    "/home/agent/claude-alt",
+  );
+  assertEquals(isolated.some((a) => a.includes("claude-alt")), false);
+  assertEquals(
+    isolated,
+    build("/home/agent/.local/share/cfg", null),
+  );
+});
+
+Deno.test("buildBwrapArgs claudeConfigDir: caller dir under a STATE_DIR is re-mounted ro and its credentials masked", () => {
+  const caller = "/home/agent/.local/state/claude";
+  const exists = (p: string) =>
+    claudeBwrapExists(p) ||
+    [`${caller}/.credentials.json`, `${caller}/.claude.json`].includes(p);
+  const argv = buildBwrapArgs(
+    ["claude"],
+    "/work/dir",
+    CLAUDE_BWRAP_HOME,
+    exists,
+    null,
+    "claude",
+    "provider",
+    null,
+    null,
+    null,
+    [],
+    "/home/agent/.local/share/cfg",
+    caller,
+  );
+  const ro = bindIndexes(argv, "--ro-bind", caller);
+  assertEquals(ro.length, 1);
+  for (const f of [".credentials.json", ".claude.json"]) {
+    const i = argv.findIndex((a, j) =>
+      a === "--ro-bind" && argv[j + 1] === "/dev/null" &&
+      argv[j + 2] === `${caller}/${f}`
+    );
+    assertEquals(i > ro[0], true, `${f} masked after the ro re-mount`);
+  }
+  // Not isolated: no masks of the caller dir.
+  assertEquals(
+    bwrapClaude(undefined, caller).some((a) => a.endsWith("/.claude.json")),
+    false,
+  );
+});
+
+Deno.test("buildBwrapArgs claudeConfigDir: HOME with a trailing slash and a trailing-slash caller dir still re-mount ro", () => {
+  const caller = "/home/agent/.local/state/claude/";
+  const argv = buildBwrapArgs(
+    ["claude"],
+    "/work/dir",
+    "/home/agent/",
+    (p) =>
+      [
+        "/home/agent/.claude",
+        "/home/agent/.local/state",
+        "/home/agent/.local/state/claude",
+      ].includes(normalizeForTest(p)),
+    null,
+    "claude",
+    "provider",
+    null,
+    null,
+    null,
+    [],
+    "/home/agent/.local/share/cfg",
+    caller,
+  );
+  assertEquals(
+    bindIndexes(argv, "--ro-bind", "/home/agent/.local/state/claude").length,
+    1,
+  );
+});
+
+function normalizeForTest(p: string): string {
+  return p.replace(/\/+/g, "/").replace(/(.)\/$/, "$1");
+}
+
+Deno.test("assertClaudeConfigDirRealPath: symlinks to or above protected dirs are rejected", () => {
+  const real: Record<string, string> = {
+    "/home/a": "/home/a",
+    "/home/a/.claude": "/home/a/dotfiles/claude",
+    "/home/a/cfg-link": "/home/a/dotfiles/claude",
+    "/home/a/dotfiles/claude": "/home/a/dotfiles/claude",
+    "/home/a/ok": "/home/a/ok",
+    "/home/a/dotfiles/claude/iso": "/home/a/dotfiles/claude/iso",
+    "/home/a/up": "/home/a",
+  };
+  const rp = (p: string) => {
+    if (p in real) return real[p];
+    throw new Deno.errors.NotFound(p);
+  };
+  for (
+    const bad of ["/home/a/cfg-link", "/home/a/dotfiles/claude", "/home/a/up"]
+  ) {
+    assertThrows(
+      () => assertClaudeConfigDirRealPath(bad, "/home/a", null, rp),
+      Error,
+      "symlinks",
+      bad,
+    );
+  }
+  assertClaudeConfigDirRealPath("/home/a/ok", "/home/a", null, rp);
+  assertClaudeConfigDirRealPath(
+    "/home/a/dotfiles/claude/iso",
+    "/home/a",
+    null,
+    rp,
+  );
+});
+
+Deno.test("runWithRetries claudeConfigDir: a symlink to the real ~/.claude is rejected before launch", async () => {
+  const home = await Deno.makeTempDir();
+  const oldHome = Deno.env.get("HOME");
+  try {
+    await Deno.mkdir(`${home}/dotfiles/claude`, { recursive: true });
+    await Deno.symlink(`${home}/dotfiles/claude`, `${home}/.claude`);
+    await Deno.symlink(`${home}/.claude`, `${home}/cfg-link`);
+    Deno.env.set("HOME", home);
+    for (const target of [`${home}/cfg-link`, `${home}/dotfiles/claude`]) {
+      await assertRejects(
+        () => runClaudeFixture("claude", target),
+        Error,
+        "symlinks",
+      );
+    }
+  } finally {
+    if (oldHome === undefined) Deno.env.delete("HOME");
+    else Deno.env.set("HOME", oldHome);
+    await Deno.remove(home, { recursive: true });
+  }
+});
+
 Deno.test("resolveClaudeConfigDir: absolute, ~/ and ephemeral values", () => {
   assertEquals(
-    resolveClaudeConfigDir(undefined, "claude", "/home/a"),
+    resolveClaudeConfigDir(undefined, "claude", "/home/a", undefined, null),
     undefined,
   );
   assertEquals(
-    resolveClaudeConfigDir("/srv/claude-cfg", "claude", "/home/a"),
+    resolveClaudeConfigDir(
+      "/srv/claude-cfg",
+      "claude",
+      "/home/a",
+      undefined,
+      null,
+    ),
     "/srv/claude-cfg",
   );
   assertEquals(
-    resolveClaudeConfigDir("~/cfg/claude", "claude", "/home/a"),
+    resolveClaudeConfigDir(
+      "~/cfg/claude",
+      "claude",
+      "/home/a",
+      undefined,
+      null,
+    ),
     "/home/a/cfg/claude",
   );
   assertEquals(
-    resolveClaudeConfigDir("ephemeral", "claude", "/home/a"),
+    resolveClaudeConfigDir("ephemeral", "claude", "/home/a", undefined, null),
     "ephemeral",
   );
 });
@@ -5240,7 +5419,7 @@ Deno.test("resolveClaudeConfigDir: absolute, ~/ and ephemeral values", () => {
 Deno.test("resolveClaudeConfigDir: relative paths are rejected", () => {
   for (const bad of ["cfg", "./cfg", "../cfg", "", "~"]) {
     assertThrows(
-      () => resolveClaudeConfigDir(bad, "claude", "/home/a"),
+      () => resolveClaudeConfigDir(bad, "claude", "/home/a", undefined, null),
       Error,
       "absolute path",
     );
@@ -5316,7 +5495,7 @@ Deno.test("resolveClaudeConfigDir: non-claude provider ignores it with a warning
   const warnings: string[] = [];
   const logger = { warning: (m: string) => warnings.push(m) } as never;
   assertEquals(
-    resolveClaudeConfigDir("/srv/cfg", "codex", "/home/a", logger),
+    resolveClaudeConfigDir("/srv/cfg", "codex", "/home/a", logger, null),
     undefined,
   );
   assertEquals(warnings.length, 1);

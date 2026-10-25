@@ -124,7 +124,7 @@ export const RepositoryExpectationSchema = z.object({
 export type RepositoryExpectation = z.infer<typeof RepositoryExpectationSchema>;
 
 const CLAUDE_CONFIG_DIR_DESCRIPTION =
-  "Isolate the claude provider from the invoking user's Claude Code config (CLAUDE.md, skills, plugins, hooks, MCP servers). An absolute path (a leading '~/' expands against the sandbox home) is used as CLAUDE_CONFIG_DIR; 'ephemeral' creates a fresh empty directory per invocation and removes it afterwards. Also passes --strict-mcp-config. On Linux bwrap the directory is bound read-write, the user's own ~/.claude and CLAUDE_CONFIG_DIR are re-mounted read-only, and ~/.claude.json and ~/.claude/.credentials.json are masked. The directory must not be the home directory, a parent of it, or equal to or a parent of ~/.claude or the caller's CLAUDE_CONFIG_DIR. On macOS seatbelt a persistent directory must be under the cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex, the opencode dirs or /tmp to be writable. Authenticate through that directory's own login or CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY. Ignored (with a warning) for other providers; unset keeps today's behaviour.";
+  "Isolate the claude provider from the invoking user's Claude Code config (CLAUDE.md, skills, plugins, hooks, MCP servers). An absolute path (a leading '~/' expands against the sandbox home) is used as CLAUDE_CONFIG_DIR; 'ephemeral' creates a fresh empty directory per invocation and removes it afterwards. Also passes --strict-mcp-config. On Linux bwrap the directory is bound read-write, the user's own ~/.claude and CLAUDE_CONFIG_DIR (when under a directory the sandbox already exposes) are re-mounted read-only, and ~/.claude.json and the credential files of both are masked. The directory must not be the home directory, a parent of it, or equal to or a parent of ~/.claude or the caller's CLAUDE_CONFIG_DIR. On macOS seatbelt writes under the home directory are denied except the cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex and the opencode dirs, so a persistent directory under the home directory elsewhere is not writable (paths outside the home, such as /tmp, are). Authenticate through that directory's own login or CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY. Ignored (with a warning) for other providers; unset keeps today's behaviour.";
 
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
@@ -769,10 +769,12 @@ export function buildBwrapArgs(
   const providerStateDirs = credentialAccess === "provider"
     ? PROVIDER_STATE_DIRS[provider] ?? []
     : [];
+  const boundStateDirs: string[] = [];
   for (const rel of [...STATE_DIRS, ...providerStateDirs]) {
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
       args.push("--bind", abs, abs);
+      boundStateDirs.push(normalizeAbsolutePath(abs));
     }
   }
 
@@ -782,17 +784,32 @@ export function buildBwrapArgs(
   // matters twice: the ro-binds must follow the STATE_DIRS binds above to win,
   // and the rw bind must follow them so an isolated dir nested inside
   // ~/.claude is not made read-only again. The caller creates `claudeConfigDir`
-  // beforehand, so it is bound unconditionally.
+  // beforehand, so it is bound unconditionally. A relocated caller config dir
+  // is only re-mounted when the loop above actually bound it (it lies under a
+  // bound state dir): otherwise it is hidden already and re-mounting it would
+  // EXPOSE it. Its credential files are masked, as the isolated child never
+  // needs them.
   if (claudeConfigDir) {
+    const normalizedHome = home ? normalizeAbsolutePath(home) : "";
+    const callerDir = userClaudeConfigDir?.startsWith("/")
+      ? normalizeAbsolutePath(userClaudeConfigDir)
+      : null;
+    const isBound = (abs: string) =>
+      boundStateDirs.some((dir) => abs === dir || abs.startsWith(dir + "/"));
     const userConfigDirs = new Set([
-      `${home}/.claude`,
-      ...(userClaudeConfigDir?.startsWith(home + "/")
-        ? [userClaudeConfigDir.replace(/\/+$/, "")]
-        : []),
+      `${normalizedHome}/.claude`,
+      ...(callerDir && isBound(callerDir) ? [callerDir] : []),
     ]);
     for (const abs of userConfigDirs) {
       if (abs !== claudeConfigDir && pathExists(abs)) {
         args.push("--ro-bind", abs, abs);
+        if (abs === callerDir) {
+          for (const file of [".credentials.json", ".claude.json"]) {
+            if (pathExists(`${abs}/${file}`)) {
+              args.push("--ro-bind", "/dev/null", `${abs}/${file}`);
+            }
+          }
+        }
       }
     }
     args.push("--bind", claudeConfigDir, claudeConfigDir);
@@ -971,7 +988,10 @@ export function wrapWithSandbox(
   const isDarwin = Deno.build.os === "darwin";
   const isLinux = Deno.build.os === "linux";
   const resolvedCwd = cwd ?? Deno.cwd();
-  const home = Deno.env.get("HOME") ?? "";
+  const rawHome = Deno.env.get("HOME") ?? "";
+  const home = rawHome.startsWith("/")
+    ? normalizeAbsolutePath(rawHome)
+    : rawHome;
 
   const backend = resolveEffectiveBackend(sandbox.mode, Deno.build.os);
 
@@ -993,11 +1013,12 @@ export function wrapWithSandbox(
       );
     }
     // Seatbelt: CLAUDE_CONFIG_DIR and --strict-mcp-config are provider-level
-    // (set by the caller). The read-only re-mounting of the user's own Claude
-    // config is bwrap-only; the static .sb profile is not parameterised per
-    // invocation, so it only allows writes under these roots.
+    // (set by the caller). The read-only re-mounting and masking of the
+    // user's own Claude config is bwrap-only; the static .sb profile is not
+    // parameterised per invocation: it denies writes under $HOME and then
+    // re-allows only these roots. Paths outside $HOME stay writable.
     if (
-      claudeConfigDir &&
+      claudeConfigDir && home && claudeConfigDir.startsWith(home + "/") &&
       ![
         resolvedCwd,
         `${home}/.cache`,
@@ -1006,15 +1027,13 @@ export function wrapWithSandbox(
         `${home}/.codex`,
         `${home}/.config/opencode`,
         `${home}/.local/share/opencode`,
-        "/tmp",
-        "/private/tmp",
       ]
         .some((root) =>
           claudeConfigDir === root || claudeConfigDir.startsWith(root + "/")
         )
     ) {
       logger?.warning(
-        `claudeConfigDir ${claudeConfigDir} is outside the paths the seatbelt profile lets claude write (cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex, the opencode dirs, /tmp); claude will not be able to write its state there`,
+        `claudeConfigDir ${claudeConfigDir} is under the home directory but outside the home paths the seatbelt profile lets claude write (cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex, the opencode dirs); claude will not be able to write its state there`,
       );
     }
     return [
@@ -3440,6 +3459,51 @@ function normalizeAbsolutePath(path: string): string {
   return "/" + out.join("/");
 }
 
+/** True when `child` equals `parent` or lies inside it (both normalized). */
+function pathContains(parent: string, child: string): boolean {
+  return parent === "/" || child === parent || child.startsWith(parent + "/");
+}
+
+/**
+ * Symlink-aware counterpart of the text checks in
+ * {@link resolveClaudeConfigDir}: the dir (which must exist) is rejected when
+ * its real path equals or contains the real path of the home directory,
+ * `~/.claude` or the caller's config dir (those that exist). A dir inside them
+ * is allowed, as in the text check. Throws before the run launches.
+ */
+export function assertClaudeConfigDirRealPath(
+  dir: string,
+  home: string,
+  callerConfigDir: string | null,
+  realPath: (p: string) => string = Deno.realPathSync,
+): void {
+  const real = (p: string): string | null => {
+    try {
+      return realPath(p);
+    } catch {
+      return null;
+    }
+  };
+  const realDir = real(dir);
+  if (!realDir) return;
+  const protectedDirs = [
+    ...(home.startsWith("/")
+      ? [normalizeAbsolutePath(home), `${normalizeAbsolutePath(home)}/.claude`]
+      : []),
+    ...(callerConfigDir?.startsWith("/")
+      ? [normalizeAbsolutePath(callerConfigDir)]
+      : []),
+  ];
+  for (const p of protectedDirs) {
+    const realProtected = real(p);
+    if (realProtected && pathContains(realDir, realProtected)) {
+      throw new Error(
+        `claudeConfigDir ${dir} resolves to ${realDir}, which must not be, or contain, ${p} (${realProtected}) once symlinks are followed`,
+      );
+    }
+  }
+}
+
 /**
  * Resolve the effective `claudeConfigDir` for one invocation: an absolute
  * path (leading `~/` expanded against `home`, the same home the sandbox
@@ -3472,8 +3536,7 @@ export function resolveClaudeConfigDir(
     // real home, nor the user's own Claude config, which would defeat the
     // isolation. A dir INSIDE ~/.claude or the caller's config dir is fine:
     // the ro re-mounts come first and the rw bind after them.
-    const contains = (parent: string, child: string) =>
-      parent === "/" || child === parent || child.startsWith(parent + "/");
+    const contains = pathContains;
     const normalizedHome = home ? normalizeAbsolutePath(home) : "";
     if (normalizedHome && contains(value, normalizedHome)) {
       throw new Error(
@@ -3584,6 +3647,13 @@ export async function runWithRetries(
           ? await Deno.makeTempDir({ prefix: "swamp-cli-agent-claude-" })
           : opts.claudeConfigDir;
         await Deno.mkdir(claudeConfigDir, { recursive: true });
+        if (!claudeConfigDirEphemeral) {
+          assertClaudeConfigDirRealPath(
+            claudeConfigDir,
+            Deno.env.get("HOME") ?? "",
+            Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
+          );
+        }
         // Standalone boolean flag right after the binary, so only MCP servers
         // passed explicitly load (none are); the prompt stays last.
         cmd.splice(1, 0, "--strict-mcp-config");
