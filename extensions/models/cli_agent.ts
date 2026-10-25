@@ -923,6 +923,24 @@ function resolveExecutablePath(command: string, cwd: string): string | null {
 }
 
 /**
+ * The caller's own `CLAUDE_CONFIG_DIR` as {@link buildBwrapArgs} should see
+ * it: its real path, because bwrap cannot mount onto a symlink destination
+ * (a symlinked config dir inside a bound state dir would otherwise fail every
+ * isolated run). Falls back to the given path when it cannot be resolved.
+ */
+export function resolveCallerClaudeConfigDir(
+  dir: string | null,
+  realPath: (path: string) => string = Deno.realPathSync,
+): string | null {
+  if (!dir) return null;
+  try {
+    return realPath(dir);
+  } catch {
+    return dir;
+  }
+}
+
+/**
  * Wrap `cmd` in an OS-level sandbox (`sandbox-exec` on macOS, `bwrap` on
  * Linux), or return it unchanged.
  *
@@ -1109,7 +1127,11 @@ export function wrapWithSandbox(
         gitMetadataPath,
         readOnlyInputFiles,
         claudeConfigDir,
-        Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
+        claudeConfigDir
+          ? resolveCallerClaudeConfigDir(
+            Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
+          )
+          : null,
       ),
     ];
   }

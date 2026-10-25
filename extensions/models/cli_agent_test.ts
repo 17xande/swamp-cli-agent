@@ -60,6 +60,7 @@ import {
   ReplayedInvocationError,
   RepositoryExpectationSchema,
   repositoryStateHash,
+  resolveCallerClaudeConfigDir,
   resolveClaudeConfigDir,
   resolveCodexExecutionOptions,
   resolveEffectiveBackend,
@@ -5590,4 +5591,23 @@ Deno.test("runWithRetries claudeConfigDir: unset adds neither env var nor flag",
   // Only the ambient value (if any) reaches the child, never a new one.
   assertEquals(configDir, Deno.env.get("CLAUDE_CONFIG_DIR") ?? "");
   assertEquals(argv.includes("--strict-mcp-config"), false);
+});
+
+Deno.test("resolveCallerClaudeConfigDir: resolves a symlinked caller config dir, falls back when unresolvable", () => {
+  const links: Record<string, string> = {
+    "/home/agent/.local/state/link": "/home/agent/.local/state/claude",
+  };
+  const realPath = (p: string): string => {
+    if (p in links) return links[p];
+    throw new Deno.errors.NotFound(p);
+  };
+  assertEquals(
+    resolveCallerClaudeConfigDir("/home/agent/.local/state/link", realPath),
+    "/home/agent/.local/state/claude",
+  );
+  assertEquals(
+    resolveCallerClaudeConfigDir("/home/agent/missing", realPath),
+    "/home/agent/missing",
+  );
+  assertEquals(resolveCallerClaudeConfigDir(null, realPath), null);
 });
