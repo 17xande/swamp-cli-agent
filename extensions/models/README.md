@@ -63,10 +63,19 @@ workspace and a fixed set of state directories, so toolchains installed there
 (mise, asdf, `~/go`, `~/.cargo`) are invisible and an `actor` run can edit code
 but not build or test it. List them in `extraBinds` (global argument, or a
 per-invocation override on `invoke`/`invokeAndParse` that replaces the global
-list). Each entry is `{ path, mode }`; `path` must be absolute or start with
-`~/`, and `mode` is `ro` (default) or `rw`. Paths that do not exist are skipped.
-A path that equals or contains a known credential file (for example `~` or
-`~/.claude`) is refused. `extraBinds` is applied on Linux bwrap only; on macOS
+list; `preflight` and `checkFactoryViability` use only the global list). Each
+entry is `{ path, mode }`; `path` must be absolute or start with `~/`, and
+`mode` is `ro` (default) or `rw`. Paths are resolved (symlinks, `..`, `//`)
+before they are checked and mounted; paths that do not exist are skipped. A
+bind is refused if it is `/`, equals or contains `$HOME`, equals or contains a
+sandbox state directory (`~/.cache`, `~/.claude`, `~/.local/state`, ...) or
+`$CLAUDE_CONFIG_DIR` inside home, or equals, contains or sits inside a secret
+path: `~/.config/swamp`, `~/.config/amp`, `~/.config/gh`, `~/.ssh`, `~/.aws`,
+`~/.gnupg`, `~/.netrc`, `~/.docker/config.json`, `~/.kube` or a known
+credential file (the `EXTRA_BIND_DENIED_PATHS` list in `cli_agent.ts` plus the
+credential files). A file under `$HOME` (for example `~/.gitconfig`) may be
+bound too. With a curl-installed mise (`~/.local/bin/mise`) the shims also need
+`~/.local/bin` bound. `extraBinds` is applied on Linux bwrap only; on macOS
 Seatbelt it is ignored with a warning.
 
 ```yaml

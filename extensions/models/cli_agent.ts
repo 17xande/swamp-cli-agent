@@ -198,7 +198,7 @@ export const GlobalArgsSchema = z.object({
       "Linux bwrap credential policy. 'provider' (default) permits only the selected provider's known file-backed login credentials so ordinary CLI login works. 'isolated' masks all known credential files and requires environment authentication. Seatbelt on macOS keeps its existing static credential policy.",
     ),
   extraBinds: z.array(ExtraBindSchema).default([]).describe(
-    "Extra host paths mounted into the Linux bwrap sandbox, e.g. $HOME-installed toolchains (~/.local/share/mise, ~/go) that are otherwise hidden. Mounted read-only unless mode is 'rw'. Paths that do not exist are skipped; paths that equal or contain a known credential file are refused. Ignored (with a warning) on macOS Seatbelt.",
+    "Extra host paths mounted into the Linux bwrap sandbox, e.g. $HOME-installed toolchains (~/.local/share/mise, ~/go) that are otherwise hidden. Mounted read-only unless mode is 'rw'. Paths that do not exist are skipped; paths that equal or contain $HOME, a credential file, a state directory or anything in EXTRA_BIND_DENIED_PATHS are refused. Symlinks are resolved first. Preflight and checkFactoryViability use only this global list, not per-invocation overrides. Ignored (with a warning) on macOS Seatbelt.",
   ),
 });
 
@@ -305,6 +305,7 @@ export const InvocationLaunchClaimSchema = z.object({
     network: SandboxNetworkEnum,
     profilePath: z.string(),
     required: z.boolean(),
+    extraBinds: z.array(ExtraBindSchema).optional(),
   }).strict(),
 }).strict();
 export type InvocationLaunchClaim = z.infer<
@@ -436,7 +437,7 @@ type SandboxConfig = {
   /** Effective network policy used to select the sandbox profile. */
   network?: "allow" | "deny";
   /** Extra host paths mounted into the bwrap sandbox (ignored by Seatbelt). */
-  extraBinds?: readonly ExtraBind[];
+  extraBinds?: z.infer<typeof ExtraBindSchema>[];
   /**
    * Path to the Seatbelt .sb profile; only read/needed when the EFFECTIVE
    * backend (see {@link resolveEffectiveBackend}) is seatbelt.
@@ -604,6 +605,119 @@ const PROVIDER_STATE_DIRS: Partial<Record<Provider, readonly string[]>> = {
   gemini: [".gemini"],
 };
 
+/**
+ * Home-relative paths holding secrets that are hidden from the sandbox by
+ * omission (not in STATE_DIRS), so an `extraBinds` entry must not equal,
+ * contain, or sit inside any of them (nor any CREDENTIAL_FILES entry), for
+ * `ro` and `rw` alike. Binding `~/.config` would otherwise expose the swamp
+ * API key, `~/.ssh` the SSH keys, and so on.
+ */
+const EXTRA_BIND_DENIED_PATHS: readonly string[] = [
+  ".config/swamp",
+  ".config/amp",
+  ".config/gh",
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".netrc",
+  ".docker/config.json",
+  ".kube",
+];
+
+type ResolvedExtraBind = {
+  /** Resolved (symlink-free) host path. */
+  source: string;
+  /** Mount point inside the sandbox. */
+  dest: string;
+  mode: "ro" | "rw";
+  isDirectory: boolean;
+};
+
+/**
+ * Expand, resolve and vet `extraBinds` for {@link buildBwrapArgs}. Paths are
+ * resolved with `realPath` (collapsing `..`, `.`, `//` and symlinks) BEFORE
+ * the checks, and the resolved path is what gets mounted, so a textual trick
+ * cannot reach a protected path. Paths that do not resolve are dropped. A
+ * path is refused (throws) if it is `/`, equals or contains `home`, equals or
+ * contains a STATE_DIRS entry or `claudeConfigDir` (a bind would shadow
+ * their writable mounts or undo a read-only re-mount), or equals, contains or
+ * sits inside an EXTRA_BIND_DENIED_PATHS / CREDENTIAL_FILES entry.
+ */
+function resolveExtraBinds(
+  extraBinds: readonly ExtraBind[],
+  home: string,
+  realPath: (p: string) => string,
+  isDirectory: (p: string) => boolean,
+  claudeConfigDir: string | undefined,
+): ResolvedExtraBind[] {
+  const tryReal = (p: string): string | null => {
+    try {
+      return realPath(p);
+    } catch {
+      return null;
+    }
+  };
+  const homeReal = tryReal(home) ?? home;
+  const homes = [...new Set([home, homeReal])];
+  const contains = (outer: string, inner: string): boolean =>
+    inner === outer || inner.startsWith(outer === "/" ? "/" : `${outer}/`);
+  const variants = (paths: string[]): string[] =>
+    [
+      ...new Set(
+        paths.flatMap((p) => [p, tryReal(p)]).filter((p) => p !== null),
+      ),
+    ] as string[];
+  const rels = (list: readonly string[]) =>
+    variants(homes.flatMap((h) => list.map((rel) => `${h}/${rel}`)));
+  const secrets = rels([...EXTRA_BIND_DENIED_PATHS, ...CREDENTIAL_FILES]);
+  const stateful = rels([
+    ...STATE_DIRS,
+    ...Object.values(PROVIDER_STATE_DIRS).flat(),
+  ]);
+  if (claudeConfigDir?.startsWith("/")) {
+    if (homes.some((h) => contains(h, claudeConfigDir))) {
+      stateful.push(...variants([claudeConfigDir]));
+    }
+  }
+  const refuseIfProtected = (given: string, p: string): void => {
+    const hit = homes.some((h) => contains(p, h))
+      ? home
+      : secrets.find((d) => contains(p, d) || contains(d, p)) ??
+        stateful.find((d) => contains(p, d));
+    if (hit !== undefined) {
+      throw new Error(
+        `extraBinds path ${given} is refused: it equals or contains protected path ${hit}`,
+      );
+    }
+  };
+
+  const out: ResolvedExtraBind[] = [];
+  for (const bind of extraBinds) {
+    const expanded = bind.path.startsWith("~/")
+      ? `${home}${bind.path.slice(1)}`
+      : bind.path;
+    if (!expanded.startsWith("/")) {
+      throw new Error(
+        `extraBinds path must be absolute or start with '~/': ${bind.path}`,
+      );
+    }
+    refuseIfProtected(bind.path, expanded.replace(/\/+$/, "") || "/");
+    const source = tryReal(expanded);
+    if (source === null) continue;
+    refuseIfProtected(bind.path, source);
+    const dest = homeReal !== home && source.startsWith(`${homeReal}/`)
+      ? `${home}${source.slice(homeReal.length)}`
+      : source;
+    out.push({
+      source,
+      dest,
+      mode: bind.mode ?? "ro",
+      isDirectory: isDirectory(source),
+    });
+  }
+  return out;
+}
+
 /** One `--bind`/`--ro-bind`/`--symlink`/etc. pair or flag emitted into a bwrap argv. */
 type BwrapArg = string;
 
@@ -688,11 +802,16 @@ type BwrapArg = string;
  * bind.
  *
  * `extraBinds` mounts caller-chosen host paths (e.g. `~/.local/share/mise`)
- * at the same path inside the sandbox, `--ro-bind` unless `mode` is `"rw"`.
- * They are emitted AFTER `--remount-ro home` (so the home tmpfs cannot shadow
- * them) and BEFORE the workspace bind (which still wins on overlap). Missing
- * paths are skipped; a relative path, or a path that equals or contains a
- * known credential file, throws so the feature cannot unmask credentials.
+ * at their resolved path inside the sandbox, `--ro-bind` unless `mode` is
+ * `"rw"`. Directories are emitted AFTER `--remount-ro home` (so the home
+ * tmpfs cannot shadow them) and BEFORE the workspace bind (which still wins
+ * on overlap); a FILE under home is bound BEFORE the remount, while the
+ * tmpfs is writable (the remount is not recursive, so it keeps its own mode).
+ * Missing paths are skipped; a relative path, or a path that equals or
+ * contains `/`, `home`, a state directory, `claudeConfigDir`, or equals,
+ * contains or sits inside an EXTRA_BIND_DENIED_PATHS / CREDENTIAL_FILES
+ * entry, throws so the feature cannot unmask secrets (see
+ * {@link resolveExtraBinds}). `realPath` and `isDirectory` are injected.
  */
 export function buildBwrapArgs(
   cmd: string[],
@@ -707,30 +826,23 @@ export function buildBwrapArgs(
   gitMetadataPath: string | null = null,
   readOnlyInputFiles: readonly string[] = [],
   extraBinds: readonly ExtraBind[] = [],
+  realPath: (p: string) => string = Deno.realPathSync,
+  isDirectory: (p: string) => boolean = (p) => {
+    try {
+      return Deno.statSync(p).isDirectory;
+    } catch {
+      return false;
+    }
+  },
+  claudeConfigDir: string | undefined = Deno.env.get("CLAUDE_CONFIG_DIR"),
 ): string[] {
-  const resolvedExtraBinds = extraBinds.map((bind) => {
-    const path = bind.path.startsWith("~/")
-      ? `${home}${bind.path.slice(1)}`
-      : bind.path;
-    if (!path.startsWith("/")) {
-      throw new Error(
-        `extraBinds path must be absolute or start with '~/': ${bind.path}`,
-      );
-    }
-    const normalized = path.length > 1 ? path.replace(/\/+$/, "") : path;
-    for (const rel of CREDENTIAL_FILES) {
-      const credential = `${home}/${rel}`;
-      if (
-        normalized === "/" || normalized === credential ||
-        credential.startsWith(`${normalized}/`)
-      ) {
-        throw new Error(
-          `extraBinds path ${bind.path} would expose credential file ${credential}`,
-        );
-      }
-    }
-    return { path: normalized, mode: bind.mode ?? "ro" };
-  }).filter((bind) => pathExists(bind.path));
+  const resolvedExtraBinds = resolveExtraBinds(
+    extraBinds,
+    home,
+    realPath,
+    isDirectory,
+    claudeConfigDir,
+  );
   const executableName = executablePath?.split("/").at(-1) ?? "provider";
   const sandboxExecutable = executableDirectoryPath
     ? `/run/cli-agent/provider-package/${executableName}`
@@ -845,8 +957,24 @@ export function buildBwrapArgs(
   if (gitMetadataPath?.startsWith(home + "/")) {
     args.push("--dir", gitMetadataPath);
   }
+  const underHome = (p: string) => p.startsWith(home + "/");
   for (const bind of resolvedExtraBinds) {
-    if (bind.path.startsWith(home + "/")) args.push("--dir", bind.path);
+    if (!underHome(bind.dest)) continue;
+    if (bind.isDirectory) {
+      args.push("--dir", bind.dest);
+    } else {
+      // A file needs a directory to live in, and its bind must happen now
+      // while the tmpfs is writable (bwrap cannot create a file mountpoint
+      // after --remount-ro). The remount is not recursive, so it keeps its
+      // own ro/rw mode.
+      const parent = bind.dest.slice(0, bind.dest.lastIndexOf("/"));
+      if (parent !== home) args.push("--dir", parent);
+      args.push(
+        bind.mode === "rw" ? "--bind" : "--ro-bind",
+        bind.source,
+        bind.dest,
+      );
+    }
   }
   args.push("--remount-ro", home);
   // Bind the workspace AFTER the home tmpfs+remount-ro bracket. If cwd is
@@ -854,10 +982,11 @@ export function buildBwrapArgs(
   // would shadow it with the tmpfs. Binding after --remount-ro home creates
   // a writable mount point on top of the read-only home tree.
   for (const bind of resolvedExtraBinds) {
+    if (underHome(bind.dest) && !bind.isDirectory) continue;
     args.push(
       bind.mode === "rw" ? "--bind" : "--ro-bind",
-      bind.path,
-      bind.path,
+      bind.source,
+      bind.dest,
     );
   }
   args.push("--bind", cwd, cwd);
@@ -3363,6 +3492,10 @@ export function sandboxConfigFrom(
 ): SandboxConfig & { network: "allow" | "deny" } {
   const mode = overrides?.sandboxMode ?? g.sandboxMode;
   const network = overrides?.sandboxNetwork ?? g.sandboxNetwork;
+  const extraBinds = (overrides?.extraBinds ?? g.extraBinds).map((b) => ({
+    path: b.path,
+    mode: b.mode ?? "ro",
+  }));
   const needsProfile = resolveEffectiveBackend(mode, Deno.build.os) ===
     "seatbelt";
   const defaultFilename = network === "deny"
@@ -3376,7 +3509,9 @@ export function sandboxConfigFrom(
     credentialAccess: overrides?.sandboxCredentialAccess ??
       g.sandboxCredentialAccess,
     network,
-    extraBinds: overrides?.extraBinds ?? g.extraBinds,
+    // Only present when non-empty so launch claims (strict schema, replay
+    // comparison) are unchanged for callers that use no extra binds.
+    ...(extraBinds.length > 0 ? { extraBinds } : {}),
     profilePath,
     required: overrides?.sandboxRequired ?? g.sandboxRequired,
   };
