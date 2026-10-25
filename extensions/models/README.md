@@ -288,6 +288,37 @@ already present in these native-client stores. Do **not** add cli-agent
    terminal `turn.completed` event. Grok headless output currently reports
    neither tokens nor cost.
 
+## Isolated Claude config (`claudeConfigDir`)
+
+By default a sandboxed `claude` run loads the invoking user's whole Claude Code
+config (personal `CLAUDE.md`, skills, plugins, hooks, MCP servers) from
+`~/.claude` or `$CLAUDE_CONFIG_DIR`, and on Linux bwrap those directories are
+mounted read-write. Set `claudeConfigDir` (global arg, or a per-invocation
+override on `invoke`/`invokeAndParse`) to make headless runs predictable and to
+keep them from changing config your own sessions use. It applies only to
+`provider: claude`; other providers ignore it with a warning. Unset keeps the
+existing behaviour.
+
+- An **absolute path** (a leading `~/` expands against the sandbox home), used
+  as `CLAUDE_CONFIG_DIR`. Created if missing. Relative paths are rejected.
+- **`ephemeral`** — a fresh empty directory under `/tmp` per invocation,
+  removed afterwards.
+
+When set, the child gets `CLAUDE_CONFIG_DIR=<dir>` and `--strict-mcp-config`
+(no MCP servers load). On Linux bwrap the directory is bound read-write and the
+user's own `~/.claude` (and `$CLAUDE_CONFIG_DIR`, if inside the home) are
+re-mounted read-only. macOS Seatbelt gets the env var and flag but no
+read-only re-mounting.
+
+**Authentication.** User credential files are not copied. Log in once per
+directory with `CLAUDE_CONFIG_DIR=<dir> claude` then `/login`, or run
+`claude setup-token` and pass `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`)
+in the environment, which already passes through to the child. `ephemeral`
+therefore needs environment authentication.
+
+A persistent directory can carry a purpose-built `CLAUDE.md`, skills, and
+settings, so actor runs get exactly the instructions you ship and nothing else.
+
 ## Invocation Resource Schema
 
 Each invocation is persisted with these fields:

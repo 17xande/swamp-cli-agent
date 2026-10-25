@@ -123,6 +123,9 @@ export const RepositoryExpectationSchema = z.object({
 }).strict();
 export type RepositoryExpectation = z.infer<typeof RepositoryExpectationSchema>;
 
+const CLAUDE_CONFIG_DIR_DESCRIPTION =
+  "Isolate the claude provider from the invoking user's Claude Code config (CLAUDE.md, skills, plugins, hooks, MCP servers). An absolute path (a leading '~/' expands against the sandbox home) is used as CLAUDE_CONFIG_DIR; 'ephemeral' creates a fresh empty directory per invocation and removes it afterwards. Also passes --strict-mcp-config. On Linux bwrap the directory is bound read-write and the user's own ~/.claude and CLAUDE_CONFIG_DIR are re-mounted read-only. Authenticate through that directory's own login or CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY. Ignored (with a warning) for other providers; unset keeps today's behaviour.";
+
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
   defaultProvider: ProviderEnum.default("claude"),
@@ -180,6 +183,9 @@ export const GlobalArgsSchema = z.object({
     .describe(
       "Linux bwrap credential policy. 'provider' (default) permits only the selected provider's known file-backed login credentials so ordinary CLI login works. 'isolated' masks all known credential files and requires environment authentication. Seatbelt on macOS keeps its existing static credential policy.",
     ),
+  claudeConfigDir: z.string().optional().describe(
+    CLAUDE_CONFIG_DIR_DESCRIPTION,
+  ),
 });
 
 type GlobalArgs = z.infer<typeof GlobalArgsSchema>;
@@ -677,6 +683,8 @@ export function buildBwrapArgs(
   executableDirectoryPath: string | null = null,
   gitMetadataPath: string | null = null,
   readOnlyInputFiles: readonly string[] = [],
+  claudeConfigDir: string | null = null,
+  userClaudeConfigDir: string | null = null,
 ): string[] {
   const executableName = executablePath?.split("/").at(-1) ?? "provider";
   const sandboxExecutable = executableDirectoryPath
@@ -766,6 +774,28 @@ export function buildBwrapArgs(
     if (pathExists(abs)) {
       args.push("--bind", abs, abs);
     }
+  }
+
+  // Isolated claude config (see resolveClaudeConfigDir): re-mount the user's
+  // own Claude config read-only so the sandboxed run cannot change what their
+  // normal sessions load, THEN bind the isolated dir read-write. The order
+  // matters twice: the ro-binds must follow the STATE_DIRS binds above to win,
+  // and the rw bind must follow them so an isolated dir nested inside
+  // ~/.claude is not made read-only again. The caller creates `claudeConfigDir`
+  // beforehand, so it is bound unconditionally.
+  if (claudeConfigDir) {
+    const userConfigDirs = new Set([
+      `${home}/.claude`,
+      ...(userClaudeConfigDir?.startsWith(home + "/")
+        ? [userClaudeConfigDir]
+        : []),
+    ]);
+    for (const abs of userConfigDirs) {
+      if (abs !== claudeConfigDir && pathExists(abs)) {
+        args.push("--ro-bind", abs, abs);
+      }
+    }
+    args.push("--bind", claudeConfigDir, claudeConfigDir);
   }
 
   const permittedCredentialFiles = credentialAccess === "provider"
@@ -923,6 +953,7 @@ export function wrapWithSandbox(
   sandboxExecPath = "/usr/bin/sandbox-exec",
   bwrapPath = BWRAP_PATH,
   readOnlyInputFiles: readonly string[] = [],
+  claudeConfigDir: string | null = null,
 ): string[] {
   if (sandbox.mode === "off") return cmd;
 
@@ -958,6 +989,10 @@ export function wrapWithSandbox(
         cmd,
       );
     }
+    // Seatbelt: CLAUDE_CONFIG_DIR and --strict-mcp-config are provider-level
+    // (set by the caller), so `claudeConfigDir` needs nothing here. The
+    // read-only re-mounting of the user's own Claude config is bwrap-only; the
+    // static .sb profile is not parameterised per invocation.
     return [
       sandboxExecPath,
       "-f",
@@ -1030,6 +1065,8 @@ export function wrapWithSandbox(
         executableDirectoryPath,
         gitMetadataPath,
         readOnlyInputFiles,
+        claudeConfigDir,
+        Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
       ),
     ];
   }
@@ -1199,6 +1236,7 @@ export async function runCli(
     idleTimeoutMs?: number;
     sandbox?: SandboxConfig;
     sandboxReadOnlyInputFiles?: readonly string[];
+    sandboxClaudeConfigDir?: string;
     logger?: MethodContext["logger"];
   },
 ): Promise<CmdResult> {
@@ -1211,6 +1249,7 @@ export async function runCli(
       undefined,
       undefined,
       opts.sandboxReadOnlyInputFiles,
+      opts.sandboxClaudeConfigDir ?? null,
     )
     : cmd;
   const start = performance.now();
@@ -1511,12 +1550,22 @@ const CLAUDE_ALLOWED_TOOLS: Record<ToolProfile, string> = {
  * past it to grab the next argv entry. Verified manually: the equals-form
  * both delivers the prompt AND enforces the allowlist (a disallowed Write
  * call was denied under `--allowedTools="Read Grep Glob"`).
+ *
+ * `isolatedConfig` (a claudeConfigDir is in effect) adds `--strict-mcp-config`
+ * so only MCP servers passed explicitly load; none are passed, so none do.
+ * It is a standalone boolean flag, placed before `--allowedTools=` and the
+ * prompt, which stays last.
  */
 export function buildClaudeCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
   toolProfile: ToolProfile,
+  _toolAllowlist?: string[],
+  _factoryBoundary?: boolean,
+  _factoryCwd?: string,
+  _codex?: CodexExecutionOptions,
+  isolatedConfig = false,
 ): { cmd: string[]; stdin?: string } {
   const cmd = [
     cliPath,
@@ -1528,6 +1577,7 @@ export function buildClaudeCommand(
     "stream-json",
     "--permission-mode",
     "dontAsk",
+    ...(isolatedConfig ? ["--strict-mcp-config"] : []),
     "--allowedTools=" + CLAUDE_ALLOWED_TOOLS[toolProfile],
   ];
   cmd.push(resolvedPrompt);
@@ -3049,6 +3099,7 @@ type CommandBuilder = (
   factoryBoundary?: boolean,
   factoryCwd?: string,
   codex?: CodexExecutionOptions,
+  isolatedConfig?: boolean,
 ) =>
   | CommandInvocation
   | Promise<CommandInvocation>;
@@ -3367,6 +3418,43 @@ export function parseJsonResponse(
 }
 
 /**
+ * Resolve the effective `claudeConfigDir` for one invocation: an absolute
+ * path (leading `~/` expanded against `home`, the same home the sandbox
+ * uses), the literal `"ephemeral"`, or `undefined` (unset, or ignored because
+ * the provider is not claude, which logs a warning). Relative paths throw:
+ * the child's cwd is the target repo, so a relative dir would silently land
+ * inside it.
+ */
+export function resolveClaudeConfigDir(
+  value: string | undefined,
+  provider: Provider,
+  home: string,
+  logger?: MethodContext["logger"],
+): string | undefined {
+  if (value === undefined) return undefined;
+  if (value !== "ephemeral") {
+    const expanded = value.startsWith("~/") && home
+      ? `${home}${value.slice(1)}`
+      : value;
+    if (!expanded.startsWith("/")) {
+      throw new Error(
+        `claudeConfigDir must be an absolute path, "~/..." or "ephemeral" (got ${
+          JSON.stringify(value)
+        })`,
+      );
+    }
+    value = expanded;
+  }
+  if (provider !== "claude") {
+    logger?.warning(
+      `claudeConfigDir is only supported for provider=claude; ignoring it for ${provider}`,
+    );
+    return undefined;
+  }
+  return value;
+}
+
+/**
  * Run a provider CLI with retries, then detect provider-reported errors.
  *
  * Retries cover three failure modes:
@@ -3397,6 +3485,8 @@ export async function runWithRetries(
     requireParseableJson?: boolean;
     retryDelayMs?: number;
     codex?: CodexExecutionOptions;
+    /** Resolved by {@link resolveClaudeConfigDir}; claude provider only. */
+    claudeConfigDir?: string;
   },
   logger?: MethodContext["logger"],
 ): Promise<RunOutcome> {
@@ -3408,6 +3498,16 @@ export async function runWithRetries(
   let attemptPrompt = resolved;
 
   while (retries <= opts.maxRetries) {
+    // An isolated claude config dir is created before launch (bwrap needs the
+    // bind source to exist) and "ephemeral" ones are removed with the run,
+    // like piConfigDir below.
+    const claudeConfigDir = provider === "claude" && opts.claudeConfigDir
+      ? opts.claudeConfigDir === "ephemeral"
+        ? `/tmp/swamp-cli-agent-claude-${crypto.randomUUID()}`
+        : opts.claudeConfigDir
+      : undefined;
+    const claudeConfigDirEphemeral = opts.claudeConfigDir === "ephemeral";
+    if (claudeConfigDir) await Deno.mkdir(claudeConfigDir, { recursive: true });
     const {
       cmd,
       stdin,
@@ -3423,6 +3523,7 @@ export async function runWithRetries(
       opts.factoryBoundary,
       opts.factoryBoundary ? opts.cwd : undefined,
       opts.codex,
+      claudeConfigDir !== undefined,
     );
     // Sandboxed pi must never read or mutate the host's credential-bearing
     // ~/.pi tree. Point it at fresh disposable state and rely on environment
@@ -3437,14 +3538,23 @@ export async function runWithRetries(
         env: {
           ...env,
           ...(piConfigDir ? { PI_CODING_AGENT_DIR: piConfigDir } : {}),
+          ...(claudeConfigDir ? { CLAUDE_CONFIG_DIR: claudeConfigDir } : {}),
         },
         wallTimeoutMs: opts.wallTimeoutMs,
         idleTimeoutMs: opts.idleTimeoutMs,
         sandbox: opts.sandbox,
         sandboxReadOnlyInputFiles,
+        sandboxClaudeConfigDir: claudeConfigDir,
         logger,
       });
     } finally {
+      if (claudeConfigDir && claudeConfigDirEphemeral) {
+        await Deno.remove(claudeConfigDir, { recursive: true }).catch(
+          (error) => {
+            if (!(error instanceof Deno.errors.NotFound)) throw error;
+          },
+        );
+      }
       if (piConfigDir) {
         await Deno.remove(piConfigDir, { recursive: true }).catch((error) => {
           if (!(error instanceof Deno.errors.NotFound)) throw error;
@@ -3915,6 +4025,10 @@ export const InvokeArgsSchema = z.object({
   ),
   sandboxCredentialAccess: SandboxCredentialAccessEnum.optional().describe(
     "Override Linux bwrap credential access for this invocation: 'provider' (default; selected provider's known file-backed login only) or 'isolated' (all known credential files masked; use environment authentication). Seatbelt on macOS is unchanged.",
+  ),
+  claudeConfigDir: z.string().optional().describe(
+    "Override the global claudeConfigDir for this invocation. " +
+      CLAUDE_CONFIG_DIR_DESCRIPTION,
   ),
 }).superRefine((args, ctx) => {
   if (
@@ -5721,6 +5835,12 @@ export const model = {
             sandboxCredentialAccess: args.sandboxCredentialAccess,
           },
         );
+        const claudeConfigDir = resolveClaudeConfigDir(
+          args.claudeConfigDir ?? context.globalArgs.claudeConfigDir,
+          provider,
+          Deno.env.get("HOME") ?? "",
+          context.logger,
+        );
 
         const launch = async () => {
           if (args.repositoryExpectation) {
@@ -5741,6 +5861,7 @@ export const model = {
               toolAllowlist: args.toolAllowlist,
               factoryBoundary: args.factoryBoundary,
               codex,
+              claudeConfigDir,
             },
             context.logger,
           );
@@ -5914,6 +6035,12 @@ export const model = {
             sandboxCredentialAccess: args.sandboxCredentialAccess,
           },
         );
+        const claudeConfigDir = resolveClaudeConfigDir(
+          args.claudeConfigDir ?? context.globalArgs.claudeConfigDir,
+          provider,
+          Deno.env.get("HOME") ?? "",
+          context.logger,
+        );
 
         const launch = async () => {
           if (args.repositoryExpectation) {
@@ -5935,6 +6062,7 @@ export const model = {
               factoryBoundary: args.factoryBoundary,
               requireParseableJson: true,
               codex,
+              claudeConfigDir,
             },
             context.logger,
           );
