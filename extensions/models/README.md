@@ -300,15 +300,22 @@ keep them from changing config your own sessions use. It applies only to
 existing behaviour.
 
 - An **absolute path** (a leading `~/` expands against the sandbox home), used
-  as `CLAUDE_CONFIG_DIR`. Created if missing. Relative paths are rejected.
-- **`ephemeral`** — a fresh empty directory under `/tmp` per invocation,
-  removed afterwards.
+  as `CLAUDE_CONFIG_DIR`. Created if missing, never removed. Relative paths are
+  rejected, as is `/`, your home directory or any parent of it, and any path
+  equal to or a parent of `~/.claude` or the swamp process's own
+  `CLAUDE_CONFIG_DIR`. A directory _inside_ either of those is allowed.
+- **`ephemeral`** — a fresh empty directory (`mkdtemp`, mode 0700, honours
+  `TMPDIR`) per invocation, removed afterwards.
 
 When set, the child gets `CLAUDE_CONFIG_DIR=<dir>` and `--strict-mcp-config`
 (no MCP servers load). On Linux bwrap the directory is bound read-write and the
 user's own `~/.claude` (and `$CLAUDE_CONFIG_DIR`, if inside the home) are
-re-mounted read-only. macOS Seatbelt gets the env var and flag but no
-read-only re-mounting.
+re-mounted read-only; `~/.claude.json` (which holds user-scope MCP servers) and
+`~/.claude/.credentials.json` are masked with `/dev/null`. macOS Seatbelt gets
+the env var and flag but no read-only re-mounting or masking, and its static
+profile only allows writes under the cwd, `~/.cache`, `~/.deno`, `~/.claude`,
+`~/.codex`, the opencode directories and `/tmp`, so a persistent directory
+elsewhere is not writable there (a warning is logged).
 
 **Authentication.** User credential files are not copied. Log in once per
 directory with `CLAUDE_CONFIG_DIR=<dir> claude` then `/login`, or run
@@ -317,7 +324,18 @@ in the environment, which already passes through to the child. `ephemeral`
 therefore needs environment authentication.
 
 A persistent directory can carry a purpose-built `CLAUDE.md`, skills, and
-settings, so actor runs get exactly the instructions you ship and nothing else.
+settings, so actor runs start from instructions you chose rather than your
+personal ones. It is not a complete lockdown:
+
+- The target repo's own `CLAUDE.md`, `.claude/settings*.json` (including hooks),
+  skills, agents and commands still load. `--strict-mcp-config` does block its
+  `.mcp.json`.
+- Managed settings under `/etc/claude-code` still apply.
+- The caller's environment passes through (`ANTHROPIC_BASE_URL`,
+  `CLAUDE_CODE_*`, and so on).
+- Only the swamp process's own `CLAUDE_CONFIG_DIR` is protected. If you
+  relocate your config that way, run swamp from the same environment as your
+  interactive sessions.
 
 ## Invocation Resource Schema
 

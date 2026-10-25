@@ -5059,44 +5059,6 @@ Deno.test("buildAmpCommand: toolAllowlist fences child to only the named tools",
 
 // --- claudeConfigDir (isolated Claude Code config) ---------------------------
 
-Deno.test("buildClaudeCommand claudeConfigDir: unset leaves argv unchanged", () => {
-  const base = buildClaudeCommand("claude", "opus", "do it", "actor").cmd;
-  assertEquals(base.includes("--strict-mcp-config"), false);
-  assertEquals(
-    buildClaudeCommand(
-      "claude",
-      "opus",
-      "do it",
-      "actor",
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      false,
-    ).cmd,
-    base,
-  );
-});
-
-Deno.test("buildClaudeCommand claudeConfigDir: isolated adds --strict-mcp-config before --allowedTools, prompt last", () => {
-  const { cmd } = buildClaudeCommand(
-    "claude",
-    "opus",
-    "do it",
-    "readonly",
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    true,
-  );
-  const strict = cmd.indexOf("--strict-mcp-config");
-  const allowed = cmd.indexOf("--allowedTools=Read Grep Glob");
-  assertEquals(strict > 0, true);
-  assertEquals(strict < allowed, true);
-  assertEquals(cmd.at(-1), "do it");
-});
-
 const CLAUDE_BWRAP_HOME = "/home/agent";
 const claudeBwrapExists = (p: string) =>
   [
@@ -5170,11 +5132,13 @@ Deno.test("buildBwrapArgs claudeConfigDir: binds the dir rw and re-mounts user c
     // The later bind wins: nothing rw-binds the user dir after the ro mount,
     // and the ro mount follows every STATE_DIRS bind.
     assertEquals(rwUser.every((i) => i < ro[0]), true);
-    assertEquals(
-      ro[0] > argv.indexOf("--bind") &&
-        ro[0] > bindIndexes(argv, "--bind", "/home/agent/.local/state")[0],
-      true,
-    );
+    // ...and follows the LAST STATE_DIR bind (every `--bind` before the
+    // isolated one other than the cwd/isolated binds).
+    const stateBinds = argv.flatMap((a, i) =>
+      a === "--bind" && argv[i + 1].startsWith("/home/agent/.") ? [i] : []
+    ).filter((i) => argv[i + 1] !== isolated);
+    assertEquals(stateBinds.length > 0, true);
+    assertEquals(ro[0] > Math.max(...stateBinds), true);
     // An isolated dir nested elsewhere stays writable (bound after).
     assertEquals(rw[0] > ro[0], true);
   }
@@ -5185,7 +5149,51 @@ Deno.test("buildBwrapArgs claudeConfigDir: binds the dir rw and re-mounts user c
   );
 });
 
-Deno.test("buildBwrapArgs claudeConfigDir: skips missing user config and does not ro-mount the isolated dir itself", () => {
+Deno.test("buildBwrapArgs claudeConfigDir: masks claude credential files when isolated, unchanged otherwise", () => {
+  const exists = (p: string) =>
+    claudeBwrapExists(p) || [
+      "/home/agent/.claude.json",
+      "/home/agent/.claude/.credentials.json",
+    ].includes(p);
+  const build = (dir: string | null) =>
+    buildBwrapArgs(
+      ["claude"],
+      "/work/dir",
+      CLAUDE_BWRAP_HOME,
+      exists,
+      null,
+      "claude",
+      "provider",
+      null,
+      null,
+      null,
+      [],
+      dir,
+      null,
+    );
+  const isolated = build("/home/agent/.local/share/cfg");
+  const plain = build(null);
+  for (
+    const f of [
+      "/home/agent/.claude.json",
+      "/home/agent/.claude/.credentials.json",
+    ]
+  ) {
+    const masked = isolated.some((a, i) =>
+      a === "--ro-bind" && isolated[i + 1] === "/dev/null" &&
+      isolated[i + 2] === f
+    );
+    assertEquals(masked, true, `${f} masked when isolated`);
+    assertEquals(bindIndexes(isolated, "--bind", f), []);
+    assertEquals(
+      bindIndexes(plain, "--bind", f).length,
+      1,
+      `${f} rw by default`,
+    );
+  }
+});
+
+Deno.test("buildBwrapArgs claudeConfigDir: skips missing user config", () => {
   const argv = bwrapClaude("/home/agent/.claude");
   assertEquals(bindIndexes(argv, "--ro-bind", "/home/agent/.claude"), []);
   assertEquals(
@@ -5239,6 +5247,71 @@ Deno.test("resolveClaudeConfigDir: relative paths are rejected", () => {
   }
 });
 
+Deno.test("resolveClaudeConfigDir: strips trailing slashes and dot segments", () => {
+  assertEquals(
+    resolveClaudeConfigDir("/srv/cfg//", "claude", "/home/a", undefined, null),
+    "/srv/cfg",
+  );
+  assertEquals(
+    resolveClaudeConfigDir(
+      "~/x/./y/../cfg/",
+      "claude",
+      "/home/a",
+      undefined,
+      null,
+    ),
+    "/home/a/x/cfg",
+  );
+});
+
+Deno.test("resolveClaudeConfigDir: rejects /, home, parents of home, and the user's own config dirs", () => {
+  const caller = "/home/a/.local/state/claude";
+  const bad = [
+    "/",
+    "~/",
+    "/home/a",
+    "/home/a/",
+    "/home",
+    "/home/a/x/..",
+    "/home/a/.claude",
+    "/home/a/.claude/",
+    "/home/a/.local/state/claude",
+    "/home/a/.local/state/claude/",
+    "/home/a/.local/state", // parent of the caller's config dir
+    "/home/a/.local",
+  ];
+  for (const value of bad) {
+    assertThrows(
+      () =>
+        resolveClaudeConfigDir(value, "claude", "/home/a", undefined, caller),
+      Error,
+      "claudeConfigDir",
+      value,
+    );
+  }
+  // Nested inside either config dir, or elsewhere, stays allowed.
+  for (
+    const ok of [
+      "/home/a/.claude/isolated",
+      "/home/a/.local/state/claude/isolated",
+      "/home/a/.local/share/cfg",
+      "/srv/cfg",
+    ]
+  ) {
+    assertEquals(
+      resolveClaudeConfigDir(ok, "claude", "/home/a", undefined, caller),
+      ok,
+    );
+  }
+  // A caller dir outside home protects nothing extra but a parent of it is rejected.
+  assertThrows(
+    () =>
+      resolveClaudeConfigDir("/srv", "claude", "/home/a", undefined, "/srv/c"),
+    Error,
+    "Claude config dir",
+  );
+});
+
 Deno.test("resolveClaudeConfigDir: non-claude provider ignores it with a warning", () => {
   const warnings: string[] = [];
   const logger = { warning: (m: string) => warnings.push(m) } as never;
@@ -5250,23 +5323,36 @@ Deno.test("resolveClaudeConfigDir: non-claude provider ignores it with a warning
   assertStringIncludes(warnings[0], "claudeConfigDir");
 });
 
-Deno.test("runWithRetries claudeConfigDir: ephemeral dir is passed to the child and removed afterwards", async () => {
+const CLAUDE_FIXTURE_SANDBOX = {
+  mode: "off",
+  provider: "claude",
+  credentialAccess: "provider",
+  network: "allow",
+  profilePath: "",
+  required: false,
+} as const;
+
+/** Runs a fake claude binary via runWithRetries; returns what the child saw. */
+async function runClaudeFixture(
+  provider: "claude" | "codex",
+  claudeConfigDir: string | undefined,
+): Promise<{ configDir: string; argv: string; ok: boolean }> {
   const dir = await Deno.makeTempDir();
-  const script = `${dir}/claude-fixture`;
+  const script = `${dir}/fixture`;
   const seenFile = `${dir}/seen`;
   await Deno.writeTextFile(
     script,
     `#!/bin/sh
 printf '%s\\n' "$CLAUDE_CONFIG_DIR" > ${JSON.stringify(seenFile)}
 printf '%s\\n' "$*" >> ${JSON.stringify(seenFile)}
-[ -d "$CLAUDE_CONFIG_DIR" ] || exit 3
+if [ -n "$CLAUDE_CONFIG_DIR" ]; then [ -d "$CLAUDE_CONFIG_DIR" ] || exit 3; fi
 printf '%s\\n' '{"type":"result","result":"ok"}'
 `,
   );
   await Deno.chmod(script, 0o700);
   try {
     const outcome = await runWithRetries(
-      "claude",
+      provider,
       script,
       "test-model",
       "hello",
@@ -5276,26 +5362,53 @@ printf '%s\\n' '{"type":"result","result":"ok"}'
         wallTimeoutMs: 5_000,
         idleTimeoutMs: 5_000,
         maxRetries: 0,
-        claudeConfigDir: "ephemeral",
-        sandbox: {
-          mode: "off",
-          provider: "claude",
-          credentialAccess: "provider",
-          network: "allow",
-          profilePath: "",
-          required: false,
-        },
+        claudeConfigDir,
+        sandbox: { ...CLAUDE_FIXTURE_SANDBOX },
       },
     );
-    assertEquals(outcome.ok, true);
     const [configDir, argv] = (await Deno.readTextFile(seenFile)).split("\n");
-    assertEquals(
-      /^\/tmp\/swamp-cli-agent-claude-[0-9a-f-]{36}$/.test(configDir),
-      true,
-    );
-    assertStringIncludes(argv, "--strict-mcp-config");
-    await assertRejects(() => Deno.stat(configDir), Deno.errors.NotFound);
+    return { configDir, argv, ok: outcome.ok };
   } finally {
     await Deno.remove(dir, { recursive: true });
   }
+}
+
+Deno.test("runWithRetries claudeConfigDir: ephemeral dir is passed to the child, flag follows the binary, dir removed afterwards", async () => {
+  const { configDir, argv, ok } = await runClaudeFixture("claude", "ephemeral");
+  assertEquals(ok, true);
+  assertEquals(
+    /^\/.*\/swamp-cli-agent-claude-[A-Za-z0-9]+$/.test(configDir),
+    true,
+  );
+  assertEquals(argv.startsWith("--strict-mcp-config --model "), true);
+  assertEquals(argv.endsWith(" hello") || argv.includes(" hello"), true);
+  await assertRejects(() => Deno.stat(configDir), Deno.errors.NotFound);
+});
+
+Deno.test("runWithRetries claudeConfigDir: a persistent dir is created and not removed afterwards", async () => {
+  const parent = await Deno.makeTempDir();
+  const target = `${parent}/nested/cfg`;
+  try {
+    const { configDir, argv, ok } = await runClaudeFixture("claude", target);
+    assertEquals(ok, true);
+    assertEquals(configDir, target);
+    assertStringIncludes(argv, "--strict-mcp-config");
+    assertEquals((await Deno.stat(target)).isDirectory, true);
+  } finally {
+    await Deno.remove(parent, { recursive: true });
+  }
+});
+
+Deno.test("runWithRetries claudeConfigDir: non-claude providers get no env var and no flag", async () => {
+  const { configDir, argv } = await runClaudeFixture("codex", "ephemeral");
+  // Only the ambient value (if any) reaches the child, never a new one.
+  assertEquals(configDir, Deno.env.get("CLAUDE_CONFIG_DIR") ?? "");
+  assertEquals(argv.includes("--strict-mcp-config"), false);
+});
+
+Deno.test("runWithRetries claudeConfigDir: unset adds neither env var nor flag", async () => {
+  const { configDir, argv } = await runClaudeFixture("claude", undefined);
+  // Only the ambient value (if any) reaches the child, never a new one.
+  assertEquals(configDir, Deno.env.get("CLAUDE_CONFIG_DIR") ?? "");
+  assertEquals(argv.includes("--strict-mcp-config"), false);
 });

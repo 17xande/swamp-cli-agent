@@ -124,7 +124,7 @@ export const RepositoryExpectationSchema = z.object({
 export type RepositoryExpectation = z.infer<typeof RepositoryExpectationSchema>;
 
 const CLAUDE_CONFIG_DIR_DESCRIPTION =
-  "Isolate the claude provider from the invoking user's Claude Code config (CLAUDE.md, skills, plugins, hooks, MCP servers). An absolute path (a leading '~/' expands against the sandbox home) is used as CLAUDE_CONFIG_DIR; 'ephemeral' creates a fresh empty directory per invocation and removes it afterwards. Also passes --strict-mcp-config. On Linux bwrap the directory is bound read-write and the user's own ~/.claude and CLAUDE_CONFIG_DIR are re-mounted read-only. Authenticate through that directory's own login or CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY. Ignored (with a warning) for other providers; unset keeps today's behaviour.";
+  "Isolate the claude provider from the invoking user's Claude Code config (CLAUDE.md, skills, plugins, hooks, MCP servers). An absolute path (a leading '~/' expands against the sandbox home) is used as CLAUDE_CONFIG_DIR; 'ephemeral' creates a fresh empty directory per invocation and removes it afterwards. Also passes --strict-mcp-config. On Linux bwrap the directory is bound read-write, the user's own ~/.claude and CLAUDE_CONFIG_DIR are re-mounted read-only, and ~/.claude.json and ~/.claude/.credentials.json are masked. The directory must not be the home directory, a parent of it, or equal to or a parent of ~/.claude or the caller's CLAUDE_CONFIG_DIR. On macOS seatbelt a persistent directory must be under the cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex, the opencode dirs or /tmp to be writable. Authenticate through that directory's own login or CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY. Ignored (with a warning) for other providers; unset keeps today's behaviour.";
 
 /** Global configuration arguments shared across all method invocations. */
 export const GlobalArgsSchema = z.object({
@@ -787,7 +787,7 @@ export function buildBwrapArgs(
     const userConfigDirs = new Set([
       `${home}/.claude`,
       ...(userClaudeConfigDir?.startsWith(home + "/")
-        ? [userClaudeConfigDir]
+        ? [userClaudeConfigDir.replace(/\/+$/, "")]
         : []),
     ]);
     for (const abs of userConfigDirs) {
@@ -798,9 +798,12 @@ export function buildBwrapArgs(
     args.push("--bind", claudeConfigDir, claudeConfigDir);
   }
 
-  const permittedCredentialFiles = credentialAccess === "provider"
-    ? new Set(PROVIDER_CREDENTIAL_FILES[provider] ?? [])
-    : new Set<string>();
+  // An isolated claude never needs ~/.claude.json (user-scope mcpServers) or
+  // ~/.claude/.credentials.json, so permit none: both are masked below.
+  const permittedCredentialFiles =
+    credentialAccess === "provider" && !claudeConfigDir
+      ? new Set(PROVIDER_CREDENTIAL_FILES[provider] ?? [])
+      : new Set<string>();
   for (const rel of CREDENTIAL_FILES) {
     const abs = `${home}/${rel}`;
     if (pathExists(abs)) {
@@ -990,9 +993,30 @@ export function wrapWithSandbox(
       );
     }
     // Seatbelt: CLAUDE_CONFIG_DIR and --strict-mcp-config are provider-level
-    // (set by the caller), so `claudeConfigDir` needs nothing here. The
-    // read-only re-mounting of the user's own Claude config is bwrap-only; the
-    // static .sb profile is not parameterised per invocation.
+    // (set by the caller). The read-only re-mounting of the user's own Claude
+    // config is bwrap-only; the static .sb profile is not parameterised per
+    // invocation, so it only allows writes under these roots.
+    if (
+      claudeConfigDir &&
+      ![
+        resolvedCwd,
+        `${home}/.cache`,
+        `${home}/.deno`,
+        `${home}/.claude`,
+        `${home}/.codex`,
+        `${home}/.config/opencode`,
+        `${home}/.local/share/opencode`,
+        "/tmp",
+        "/private/tmp",
+      ]
+        .some((root) =>
+          claudeConfigDir === root || claudeConfigDir.startsWith(root + "/")
+        )
+    ) {
+      logger?.warning(
+        `claudeConfigDir ${claudeConfigDir} is outside the paths the seatbelt profile lets claude write (cwd, ~/.cache, ~/.deno, ~/.claude, ~/.codex, the opencode dirs, /tmp); claude will not be able to write its state there`,
+      );
+    }
     return [
       sandboxExecPath,
       "-f",
@@ -1550,22 +1574,12 @@ const CLAUDE_ALLOWED_TOOLS: Record<ToolProfile, string> = {
  * past it to grab the next argv entry. Verified manually: the equals-form
  * both delivers the prompt AND enforces the allowlist (a disallowed Write
  * call was denied under `--allowedTools="Read Grep Glob"`).
- *
- * `isolatedConfig` (a claudeConfigDir is in effect) adds `--strict-mcp-config`
- * so only MCP servers passed explicitly load; none are passed, so none do.
- * It is a standalone boolean flag, placed before `--allowedTools=` and the
- * prompt, which stays last.
  */
 export function buildClaudeCommand(
   cliPath: string,
   model: ModelId,
   resolvedPrompt: string,
   toolProfile: ToolProfile,
-  _toolAllowlist?: string[],
-  _factoryBoundary?: boolean,
-  _factoryCwd?: string,
-  _codex?: CodexExecutionOptions,
-  isolatedConfig = false,
 ): { cmd: string[]; stdin?: string } {
   const cmd = [
     cliPath,
@@ -1577,7 +1591,6 @@ export function buildClaudeCommand(
     "stream-json",
     "--permission-mode",
     "dontAsk",
-    ...(isolatedConfig ? ["--strict-mcp-config"] : []),
     "--allowedTools=" + CLAUDE_ALLOWED_TOOLS[toolProfile],
   ];
   cmd.push(resolvedPrompt);
@@ -3099,7 +3112,6 @@ type CommandBuilder = (
   factoryBoundary?: boolean,
   factoryCwd?: string,
   codex?: CodexExecutionOptions,
-  isolatedConfig?: boolean,
 ) =>
   | CommandInvocation
   | Promise<CommandInvocation>;
@@ -3417,6 +3429,17 @@ export function parseJsonResponse(
   }
 }
 
+/** Collapse `//`, `.` and `..` segments and trailing slashes of an absolute path. */
+function normalizeAbsolutePath(path: string): string {
+  const out: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") out.pop();
+    else out.push(part);
+  }
+  return "/" + out.join("/");
+}
+
 /**
  * Resolve the effective `claudeConfigDir` for one invocation: an absolute
  * path (leading `~/` expanded against `home`, the same home the sandbox
@@ -3430,6 +3453,7 @@ export function resolveClaudeConfigDir(
   provider: Provider,
   home: string,
   logger?: MethodContext["logger"],
+  callerConfigDir: string | null = Deno.env.get("CLAUDE_CONFIG_DIR") ?? null,
 ): string | undefined {
   if (value === undefined) return undefined;
   if (value !== "ephemeral") {
@@ -3443,7 +3467,35 @@ export function resolveClaudeConfigDir(
         })`,
       );
     }
-    value = expanded;
+    value = normalizeAbsolutePath(expanded);
+    // bwrap binds this dir read-write, so it must not be (or contain) the
+    // real home, nor the user's own Claude config, which would defeat the
+    // isolation. A dir INSIDE ~/.claude or the caller's config dir is fine:
+    // the ro re-mounts come first and the rw bind after them.
+    const contains = (parent: string, child: string) =>
+      parent === "/" || child === parent || child.startsWith(parent + "/");
+    const normalizedHome = home ? normalizeAbsolutePath(home) : "";
+    if (normalizedHome && contains(value, normalizedHome)) {
+      throw new Error(
+        `claudeConfigDir ${value} must not be the home directory or one of its parents`,
+      );
+    }
+    if (value === "/") {
+      throw new Error("claudeConfigDir must not be /");
+    }
+    const protectedDirs = [
+      ...(normalizedHome ? [`${normalizedHome}/.claude`] : []),
+      ...(callerConfigDir?.startsWith("/")
+        ? [normalizeAbsolutePath(callerConfigDir)]
+        : []),
+    ];
+    for (const dir of protectedDirs) {
+      if (contains(value, dir)) {
+        throw new Error(
+          `claudeConfigDir ${value} must not be, or contain, the Claude config dir ${dir}`,
+        );
+      }
+    }
   }
   if (provider !== "claude") {
     logger?.warning(
@@ -3498,16 +3550,6 @@ export async function runWithRetries(
   let attemptPrompt = resolved;
 
   while (retries <= opts.maxRetries) {
-    // An isolated claude config dir is created before launch (bwrap needs the
-    // bind source to exist) and "ephemeral" ones are removed with the run,
-    // like piConfigDir below.
-    const claudeConfigDir = provider === "claude" && opts.claudeConfigDir
-      ? opts.claudeConfigDir === "ephemeral"
-        ? `/tmp/swamp-cli-agent-claude-${crypto.randomUUID()}`
-        : opts.claudeConfigDir
-      : undefined;
-    const claudeConfigDirEphemeral = opts.claudeConfigDir === "ephemeral";
-    if (claudeConfigDir) await Deno.mkdir(claudeConfigDir, { recursive: true });
     const {
       cmd,
       stdin,
@@ -3523,7 +3565,6 @@ export async function runWithRetries(
       opts.factoryBoundary,
       opts.factoryBoundary ? opts.cwd : undefined,
       opts.codex,
-      claudeConfigDir !== undefined,
     );
     // Sandboxed pi must never read or mutate the host's credential-bearing
     // ~/.pi tree. Point it at fresh disposable state and rely on environment
@@ -3531,7 +3572,22 @@ export async function runWithRetries(
     const piConfigDir = provider === "pi" && opts.sandbox?.mode !== "off"
       ? `/tmp/swamp-cli-agent-pi-${crypto.randomUUID()}`
       : undefined;
+    // An isolated claude config dir is created before launch (bwrap needs the
+    // bind source to exist) and "ephemeral" ones are removed with the run,
+    // like piConfigDir below.
+    const claudeConfigDirEphemeral = provider === "claude" &&
+      opts.claudeConfigDir === "ephemeral";
+    let claudeConfigDir: string | undefined;
     try {
+      if (provider === "claude" && opts.claudeConfigDir) {
+        claudeConfigDir = claudeConfigDirEphemeral
+          ? await Deno.makeTempDir({ prefix: "swamp-cli-agent-claude-" })
+          : opts.claudeConfigDir;
+        await Deno.mkdir(claudeConfigDir, { recursive: true });
+        // Standalone boolean flag right after the binary, so only MCP servers
+        // passed explicitly load (none are); the prompt stays last.
+        cmd.splice(1, 0, "--strict-mcp-config");
+      }
       lastResult = await runCli(cmd, {
         cwd: opts.cwd,
         stdin,
